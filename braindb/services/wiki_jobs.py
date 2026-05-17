@@ -113,15 +113,66 @@ def claim_jobs(conn, job_ids: list[str]) -> int:
 ORPHAN_ENTITY_TYPES = ("keyword", "thought", "fact")
 
 
+def _orphan_conditions(exclude_job: bool = False) -> str:
+    """
+    The SINGLE definition of "orphan" (entity not yet covered by a wiki),
+    shared by `run_cron` (set-based) and `is_orphan` (per-entity) so the two
+    can never drift. References the entity as `e.id`. All conditions are
+    param-free EXCEPT the optional `exclude_job` clause (one %s) used by the
+    maintainer staleness guard to ignore the just-claimed triage row itself.
+
+    An orphan is an entity that:
+      * is not the target of a `wiki --summarises--> e` relation,
+      * is not listed in any wiki's `member_keyword_ids`,
+      * is not referenced by an active (pending/assigned) wiki_job,
+      * does not carry a `rejected` triage (deliberate-skip self-clearing;
+        `failed` triage is NOT excluded so transient errors still retry).
+    """
+    xj = " AND j.id <> %s" if exclude_job else ""
+    return f"""
+        NOT EXISTS (
+            SELECT 1 FROM relations r
+            JOIN entities w ON w.id = r.from_entity_id AND w.entity_type = 'wiki'
+            WHERE r.relation_type = 'summarises' AND r.to_entity_id = e.id
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM wikis_ext wx WHERE e.id = ANY(wx.member_keyword_ids)
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM wiki_job j
+            WHERE j.status IN ('pending','assigned')
+              AND e.id = ANY(j.entity_ids){xj}
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM wiki_job j
+            WHERE j.job_type = 'triage' AND j.status = 'rejected'
+              AND e.id = ANY(j.entity_ids)
+        )
+    """
+
+
+def is_orphan(conn, entity_id, exclude_triage_job_id: str | None = None) -> bool:
+    """True if the entity is still uncovered by any wiki. Used by the
+    maintainer staleness guard: if a prior writer run already absorbed/linked
+    the entity (or it is already in an active suggestion), this returns False
+    and the maintainer skips it with NO LLM call. Same predicate as cron."""
+    cond = _orphan_conditions(exclude_job=exclude_triage_job_id is not None)
+    params: list = [str(entity_id)]
+    if exclude_triage_job_id is not None:
+        params.append(str(exclude_triage_job_id))
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT EXISTS (SELECT 1 FROM entities e WHERE e.id = %s AND {cond})",
+            params,
+        )
+        return bool(cur.fetchone()[0])
+
+
 def run_cron(conn) -> dict:
     """
     Find entities not yet connected to any wiki and enqueue one `triage`
     job per orphan. Pure SQL, read-only except the additive job insert.
-
-    An orphan is an entity of an ORPHAN_ENTITY_TYPES type that:
-      * is not the target of a `wiki --summarises--> e` relation,
-      * is not listed in any wiki's `member_keyword_ids`,
-      * is not already referenced by an active (pending/assigned) wiki_job.
+    Orphan-ness is the shared `_orphan_conditions()` (see there).
 
     Idempotent: the partial-unique index on `dedupe_key WHERE status IN
     ('pending','assigned')` + ON CONFLICT DO NOTHING means re-running cron
@@ -130,33 +181,12 @@ def run_cron(conn) -> dict:
     batch_id = str(uuid.uuid4())
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """
+            f"""
             WITH orphans AS (
                 SELECT e.id
                 FROM entities e
                 WHERE e.entity_type = ANY(%s)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM relations r
-                      JOIN entities w ON w.id = r.from_entity_id AND w.entity_type = 'wiki'
-                      WHERE r.relation_type = 'summarises' AND r.to_entity_id = e.id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM wikis_ext wx WHERE e.id = ANY(wx.member_keyword_ids)
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM wiki_job j
-                      WHERE j.status IN ('pending','assigned')
-                        AND e.id = ANY(j.entity_ids)
-                  )
-                  -- skip self-clearing: a deliberate maintainer 'skip' closes
-                  -- the triage as 'rejected'. Never re-enqueue those (mirrors
-                  -- not_duplicate permanence). 'failed' triage (transient
-                  -- provider errors) is intentionally NOT excluded so it retries.
-                  AND NOT EXISTS (
-                      SELECT 1 FROM wiki_job j
-                      WHERE j.job_type = 'triage' AND j.status = 'rejected'
-                        AND e.id = ANY(j.entity_ids)
-                  )
+                  AND {_orphan_conditions()}
             )
             INSERT INTO wiki_job (job_type, status, entity_ids, dedupe_key, batch_id)
             SELECT 'triage', 'pending', ARRAY[o.id], 'triage:' || o.id::text, %s::uuid
@@ -186,7 +216,9 @@ def claim_one_triage(conn) -> dict | None:
     """
     Atomically claim a single pending triage job (C1: one case per call).
     FOR UPDATE SKIP LOCKED guarantees two concurrent maintainer calls never
-    grab the same case.
+    grab the same case. Highest-importance orphan first, so high-value
+    concepts get wikis early and their writer runs absorb neighbourhoods
+    (more downstream triage becomes free stale-skips).
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
@@ -194,10 +226,11 @@ def claim_one_triage(conn) -> dict | None:
             UPDATE wiki_job
                SET status = 'assigned', assigned_at = now(), attempts = attempts + 1
              WHERE id = (
-                 SELECT id FROM wiki_job
-                  WHERE status = 'pending' AND job_type = 'triage'
-                  ORDER BY created_at
-                  FOR UPDATE SKIP LOCKED
+                 SELECT j.id FROM wiki_job j
+                  JOIN entities e ON e.id = j.entity_ids[1]
+                  WHERE j.status = 'pending' AND j.job_type = 'triage'
+                  ORDER BY e.importance DESC, j.created_at
+                  FOR UPDATE OF j SKIP LOCKED
                   LIMIT 1
              )
             RETURNING id, entity_ids::text[] AS entity_ids, batch_id

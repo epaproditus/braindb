@@ -33,7 +33,7 @@ Relations connect any two entities with `relation_type`, `relevance_score`, `imp
 
 ## Setup
 
-BrainDB runs as two Docker services — `api` and `watcher` — against an **external** PostgreSQL you provide. The whole setup is six steps.
+BrainDB runs as three Docker services — `api`, `watcher` (auto-ingests files), and `wiki_scheduler` (auto-maintains wikis) — against an **external** PostgreSQL you provide. The two sidecars are hands-off: you never call the pipeline by hand. The whole setup is six steps.
 
 ### 1. Prerequisites
 
@@ -270,6 +270,33 @@ curl -X POST http://localhost:8000/api/v1/entities/datasources/ingest \
 
 It's idempotent by content hash — re-calling with the same bytes returns 200 (existing) instead of 201 (new).
 
+## Autonomous Wiki Maintenance
+
+The second always-on sidecar, `wiki_scheduler`, makes the knowledge graph
+self-organise into human-readable **wiki pages** with **zero manual steps** —
+the same hands-off model as file ingestion. It loops in the background:
+discovers entities not yet covered by a wiki, lets the in-house agent decide
+where each belongs (attach to an existing wiki / create a new one / consolidate
+duplicates / skip), and the writer agent researches and writes/maintains each
+page, keeping it grounded and self-correcting. Started automatically by
+`docker compose up -d` (like `watcher`); just watch it work:
+
+```bash
+docker logs braindb_wiki_scheduler -f   # the autonomous loop
+docker logs braindb_api -f              # the agent doing the work
+```
+
+You do **not** drive this by hand. The `POST /api/v1/wiki/{cron,maintain,write}`
+endpoints exist for **debugging / inspection only** — normal operation is the
+sidecar. (Optional read-only review: `docker compose exec api python -m
+braindb.tools.export_wikis` writes a markdown snapshot of every wiki +
+provenance to `data/wiki_review/`.)
+
+**Cost control:** like the `watcher`, this sidecar drives the LLM
+automatically. To run without it, bring the stack up excluding the service or
+scale it to 0 (`docker compose up -d --scale wiki_scheduler=0`), exactly as
+you would for the watcher; or point `LLM_PROFILE` at a local model.
+
 ## Stack
 
 - Python 3.12 + FastAPI + psycopg2 (sync, no ORM)
@@ -277,4 +304,4 @@ It's idempotent by content hash — re-calling with the same bytes returns 200 (
 - Alembic migrations
 - `sentence-transformers` + `Qwen/Qwen3-Embedding-0.6B` for keyword embeddings
 - `openai-agents[litellm]` + LiteLLM for the internal agent (DeepInfra / NIM / others pluggable via `LLM_PROFILE`)
-- Docker Compose — `api` + `watcher` services, external PostgreSQL
+- Docker Compose — `api` + `watcher` + `wiki_scheduler` services, external PostgreSQL

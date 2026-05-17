@@ -67,20 +67,28 @@ async def wiki_maintain():
     asks the existing agent to decide attach/create/consolidate/skip for that
     single orphan, persists the resulting suggestion job, closes the triage.
     """
-    # 1. Claim one case (committed on exit of this block).
+    # 1. Claim one case + staleness guard, atomically (one transaction).
     with get_conn() as conn:
         job = wiki_jobs.claim_one_triage(conn)
         if not job:
             return {"claimed": 0, "message": "no pending triage jobs"}
         orphan_id = job["entity_ids"][0]
-        orphan = wiki_jobs.fetch_entity_brief(conn, orphan_id)
         job_id = str(job["id"])
         batch_id = str(job["batch_id"]) if job["batch_id"] else None
+        orphan = wiki_jobs.fetch_entity_brief(conn, orphan_id)
 
-    if not orphan:
-        with get_conn() as conn:
+        if not orphan:
             wiki_jobs.finish_job(conn, job_id, "failed", "orphan entity not found")
-        return {"claimed": 1, "job_id": job_id, "result": "failed", "reason": "orphan missing"}
+            return {"claimed": 1, "job_id": job_id, "result": "failed",
+                    "reason": "orphan missing"}
+
+        # Stale-skip: a prior writer run may have already absorbed/linked this
+        # entity (or it's already in an active suggestion). If so, close the
+        # triage with NO LLM call — the writer's broad research retired it.
+        if not wiki_jobs.is_orphan(conn, orphan_id, exclude_triage_job_id=job_id):
+            wiki_jobs.finish_job(conn, job_id, "done",
+                                 "already covered — absorbed by a wiki")
+            return {"claimed": 1, "job_id": job_id, "result": "skipped_stale"}
 
     # 2. One agent call. The prompt directs it to RESEARCH the neighbourhood
     #    with its own tools (recall_memory / view_tree / delegate_to_subagent)

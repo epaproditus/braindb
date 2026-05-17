@@ -4,6 +4,16 @@
 > implementation proceeds. The frozen, as-approved snapshot is
 > [`maintainer-agent-plan2.md`](maintainer-agent-plan2.md) — do not edit that one.
 
+> **Operating model (current):** wiki maintenance is **hands-off, default-on**.
+> `wiki_scheduler` is a normal always-on compose sidecar (same posture as the
+> ingest `watcher`, no opt-in profile) that loops cron(~20m) → maintain →
+> write autonomously. The `/api/v1/wiki/{cron,maintain,write}` endpoints are
+> **dev/debugging only**, never the operating procedure. The maintainer
+> staleness guard + skip-self-clearing keep it idempotent and cheap. Disable
+> for cost like the watcher (exclude the service / scale to 0). Inspection
+> (`export_wikis`) is an optional read-only dev tool, outside the operating
+> path; no test scaffolding lives in operational modules.
+
 ## ⚠ Correction applied (supersedes earlier "gate/manifest/ledger" design)
 
 The first implementation inserted programmatic algorithms between the process

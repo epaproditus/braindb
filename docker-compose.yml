@@ -42,22 +42,21 @@ services:
       - .:/app
     command: python -m braindb.ingest_watcher
 
-  # Stage-2 always-on wiki pipeline. Opt-in via a compose profile so a plain
-  # `docker compose up` does NOT start it (auto-draining the backlog would
-  # spend LLM credits unprompted). Enable explicitly:
-  #   docker compose --profile wiki up -d wiki_scheduler
+  # Always-on wiki maintenance sidecar — same posture as `watcher`. It loops
+  # cron -> maintain -> write so wikis self-organise from entities with zero
+  # manual steps. To run without it (e.g. cost control), start the stack
+  # excluding this service or scale it to 0 — exactly as you would the watcher.
   wiki_scheduler:
     build: .
     container_name: braindb_wiki_scheduler
     restart: unless-stopped
-    profiles: ["wiki"]
     depends_on:
       - api
     networks:
       - local-network
     environment:
       BRAINDB_API_URL: http://api:${API_PORT:-8000}
-      WIKI_CRON_INTERVAL: ${WIKI_CRON_INTERVAL:-3600}
+      WIKI_CRON_INTERVAL: ${WIKI_CRON_INTERVAL:-1200}
       WIKI_MAINTAIN_INTERVAL: ${WIKI_MAINTAIN_INTERVAL:-45}
       WIKI_WRITE_INTERVAL: ${WIKI_WRITE_INTERVAL:-60}
     volumes:

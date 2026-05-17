@@ -20,6 +20,11 @@ _LLM_PROFILES: dict[str, dict[str, str]] = {
         "api_key_env": "VLLM_API_KEY",
         "base_url": "http://host.docker.internal:8002/v1",
     },
+    "vllm_workstation_qwen": {
+        "model": "openai/cyankiwi/Qwen3.6-27B-AWQ-INT4",
+        "api_key_env": "VLLM_API_KEY",
+        "base_url": "http://host.docker.internal:8010/v1",
+    },
 }
 
 

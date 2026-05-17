@@ -23,7 +23,7 @@ import time
 import requests
 
 API_URL = os.getenv("BRAINDB_API_URL", "http://localhost:8000")
-CRON_INTERVAL = int(os.getenv("WIKI_CRON_INTERVAL", "3600"))       # 1h
+CRON_INTERVAL = int(os.getenv("WIKI_CRON_INTERVAL", "1200"))       # ~20m: slow scan; lets ingestion settle (no in-flight detection — just a long interval)
 MAINTAIN_INTERVAL = int(os.getenv("WIKI_MAINTAIN_INTERVAL", "45"))  # one case / 45s
 WRITE_INTERVAL = int(os.getenv("WIKI_WRITE_INTERVAL", "60"))        # one wiki / 60s
 TICK = int(os.getenv("WIKI_SCHEDULER_TICK", "5"))
