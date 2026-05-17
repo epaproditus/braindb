@@ -5,6 +5,29 @@ The API runs at **http://localhost:8000**.
 
 ---
 
+## ⚠ TOOL PRIORITY — read this first, it overrides habit
+
+BrainDB's entire value is the **graph + embeddings + ranking**. Recall and
+understanding must go through the sophisticated retrieval, never a flat SQL
+`SELECT`.
+
+1. **`POST /api/v1/memory/context`** (multi-query) — the default for ALL
+   recall, discovery, disambiguation, "what do we know about X": fuzzy +
+   full-text + **keyword-embedding** + graph traversal + temporal decay +
+   `final_rank`.
+2. **`POST /api/v1/agent/query`** (ask it to *delegate to a subagent* for
+   anything multi-step) — research/investigation that needs several hops.
+3. `GET /api/v1/entities…`, `/memory/tree/<id>`, `/entities/<id>/relations` —
+   targeted structure lookups.
+4. **`POST /api/v1/memory/sql` — exception ONLY.** A flat SELECT throws away
+   embeddings, graph and ranking. Use it solely for a specific
+   structured/aggregate question (counts, GROUP BY, activity-log joins) the
+   above genuinely cannot express. **Never** for recall, discovery,
+   similarity, or understanding. If you're using SQL to *find* or *understand*
+   something, you're doing it wrong — use `/memory/context`.
+
+---
+
 ## At the Start of Every Session
 
 Before doing any work, consult your memory:

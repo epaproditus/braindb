@@ -85,6 +85,27 @@ If the final curl returns `{"status":"ok"}`, you're live.
 
 ---
 
+## TOOL PRIORITY (read this first)
+
+BrainDB's power is the graph + embeddings + ranking. Use it; do not fall back
+to flat SQL.
+
+1. **`POST /api/v1/memory/context`** (multi-query) — the default for ALL
+   recall, discovery, and understanding: fuzzy + full-text + **keyword
+   embedding** + graph traversal + decay + ranking.
+2. **`POST /api/v1/agent/query` with "delegate to a subagent…"** — for
+   multi-step investigation/disambiguation; the agent researches and returns a
+   summary.
+3. `GET /api/v1/entities…`, `GET /api/v1/memory/tree/<id>`,
+   `GET /api/v1/entities/<id>/relations` — targeted structure lookups.
+4. **`POST /api/v1/memory/sql` — exception only.** A flat SELECT has no
+   embeddings/graph/ranking. Use it solely for a specific structured/aggregate
+   question (counts, GROUP BY, activity-log joins) the above cannot express.
+   **Never** for recall, discovery, similarity, or understanding.
+
+If you're about to use `/memory/sql` to *find* or *understand* something,
+stop — that's a `/memory/context` (or delegated `/agent/query`) job.
+
 ## RECALL — Before Responding
 
 ### Step 1: Formulate targeted queries
@@ -295,9 +316,14 @@ curl -s "http://localhost:8000/api/v1/memory/log?since=2026-04-08T00:00:00Z"
 
 Use this to answer "when did I learn this?" or "what was I working on yesterday?"
 
-### Read-only SQL — power queries
+### Read-only SQL — EXCEPTION tool, aggregations only
 
-For ad-hoc exploration and aggregations the standard endpoints don't cover. Only `SELECT` and `WITH` queries are allowed; 5s timeout; 1000 row limit.
+⚠ Not a recall/discovery tool (see TOOL PRIORITY at the top). A flat SELECT
+throws away embeddings, graph and ranking — everything BrainDB is good at.
+Use it **only** for a specific structured/aggregate question the dedicated
+endpoints cannot express (counts, GROUP BY, activity-log joins). For finding
+or understanding anything, use `/memory/context` or a delegated `/agent/query`.
+Only `SELECT` and `WITH` queries are allowed; 5s timeout; 1000 row limit.
 
 ```bash
 # Count entities by source
@@ -316,7 +342,8 @@ curl -s -X POST http://localhost:8000/api/v1/memory/sql \
   -d '{"query": "SELECT l.timestamp, l.operation, e.content FROM activity_log l JOIN entities e ON e.id = l.entity_id ORDER BY l.timestamp DESC LIMIT 20"}'
 ```
 
-Prefer the dedicated endpoints for normal operations. Use SQL when you need something unusual.
+Reiterate: `/memory/context` (+ delegated `/agent/query`) is the default for
+everything. `/memory/sql` is the rare exception for true aggregations only.
 
 ---
 

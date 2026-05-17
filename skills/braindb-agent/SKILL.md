@@ -26,6 +26,15 @@ BrainDB has its own internal agent (LiteLLM + NVIDIA NIM) that handles all memor
 
 ---
 
+## TOOL PRIORITY
+
+The agent already uses the sophisticated retrieval (keyword-embedding + graph
++ ranking) and can delegate to subagents. Phrase requests as goals ("find /
+recall / understand …", "delegate a deep investigation of …"). **Do not tell
+it to "run SQL"** for recall or understanding — raw SQL discards the graph and
+embeddings. SQL is only ever for an explicit aggregate ("how many facts per
+source?"), which you can simply ask for in plain English anyway.
+
 ## RECALL — at conversation start, and whenever you need context
 
 Ask the agent in natural language. It handles keyword formulation, multi-query search, graph traversal, and summarization.

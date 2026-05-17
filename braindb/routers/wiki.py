@@ -1,0 +1,352 @@
+"""
+Wiki pipeline endpoints: cron / maintain / write / jobs.
+
+Stage 1 is manual (no scheduler) — these endpoints are driven by hand or by
+the Stage-2 `wiki_scheduler` sidecar. `/cron` and `/jobs` are pure SQL and
+non-destructive; `/maintain` and `/write` (later steps) drive the existing
+agent endpoint.
+"""
+import json
+import logging
+from pathlib import Path
+
+from fastapi import APIRouter, Query
+
+from braindb.agent.agent import run_agent_query
+from braindb.db import get_conn
+from braindb.services.activity_log import log_activity
+from braindb.services import wiki_jobs
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/v1/wiki", tags=["wiki"])
+
+_PROMPTS = Path(__file__).parent.parent / "agent" / "prompts"
+_MAINTAINER_PROMPT = (_PROMPTS / "wiki_maintainer_prompt.md").read_text(encoding="utf-8")
+_WRITER_PROMPT = (_PROMPTS / "wiki_writer_prompt.md").read_text(encoding="utf-8")
+
+
+def _between(text: str, start: str, end: str) -> str | None:
+    i = text.find(start)
+    j = text.find(end, i + len(start)) if i != -1 else -1
+    return text[i + len(start):j].strip() if i != -1 and j != -1 else None
+
+
+def _extract_json(text: str) -> dict | None:
+    """Pull the first balanced JSON object out of the agent's answer."""
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+        start = text.find("{", start + 1)
+    return None
+
+
+@router.post("/cron")
+def wiki_cron():
+    """Read-only orphan scan; enqueues one `triage` job per orphan. Idempotent."""
+    with get_conn() as conn:
+        result = wiki_jobs.run_cron(conn)
+        log_activity(conn, "wiki_cron", None, None, details=result)
+        return result
+
+
+@router.post("/maintain")
+async def wiki_maintain():
+    """
+    Process EXACTLY ONE triage case (C1). Claims one pending triage job,
+    asks the existing agent to decide attach/create/consolidate/skip for that
+    single orphan, persists the resulting suggestion job, closes the triage.
+    """
+    # 1. Claim one case (committed on exit of this block).
+    with get_conn() as conn:
+        job = wiki_jobs.claim_one_triage(conn)
+        if not job:
+            return {"claimed": 0, "message": "no pending triage jobs"}
+        orphan_id = job["entity_ids"][0]
+        orphan = wiki_jobs.fetch_entity_brief(conn, orphan_id)
+        job_id = str(job["id"])
+        batch_id = str(job["batch_id"]) if job["batch_id"] else None
+
+    if not orphan:
+        with get_conn() as conn:
+            wiki_jobs.finish_job(conn, job_id, "failed", "orphan entity not found")
+        return {"claimed": 1, "job_id": job_id, "result": "failed", "reason": "orphan missing"}
+
+    # 2. One agent call. The prompt directs it to RESEARCH the neighbourhood
+    #    with its own tools (recall_memory / view_tree / delegate_to_subagent)
+    #    before deciding — we give the seed, the LLM gathers the context.
+    #    Generous turns so it can actually investigate / delegate.
+    prompt = _MAINTAINER_PROMPT.format(
+        entity_id=orphan_id,
+        entity_type=orphan["entity_type"],
+        keywords=orphan.get("keywords") or [],
+        summary=orphan.get("summary"),
+        content=(orphan.get("content") or "")[:4000],
+    )
+    try:
+        agent_out = await run_agent_query(prompt, max_turns=30)
+        answer = agent_out.get("answer", "")
+    except Exception as e:
+        logger.exception("maintainer agent failed")
+        with get_conn() as conn:
+            wiki_jobs.finish_job(conn, job_id, "failed", f"agent error: {e}"[:500])
+        return {"claimed": 1, "job_id": job_id, "result": "failed", "reason": str(e)}
+
+    decision = _extract_json(answer)
+    if not decision or "action" not in decision:
+        with get_conn() as conn:
+            wiki_jobs.finish_job(conn, job_id, "failed", f"unparseable: {answer[:400]}")
+        return {"claimed": 1, "job_id": job_id, "result": "failed", "reason": "unparseable agent output"}
+
+    action = decision.get("action")
+    rationale = decision.get("rationale")
+
+    # 3. Persist the suggestion + close the triage, in one transaction.
+    with get_conn() as conn:
+        try:
+            if action in ("skip", "ambiguous"):
+                # 'ambiguous' = the data cannot disambiguate identity/scope;
+                # the LLM correctly refuses to mint a confident page. Treated
+                # as a deliberate skip (self-clears via run_cron).
+                wiki_jobs.finish_job(conn, job_id, "rejected", rationale)
+                outcome = {"action": action}
+
+            elif action == "attach":
+                target = decision.get("target_wiki_id")
+                if not target or not _is_wiki(conn, target):
+                    wiki_jobs.finish_job(conn, job_id, "failed", f"invalid target_wiki_id {target}")
+                    outcome = {"action": "attach", "error": "invalid target_wiki_id"}
+                else:
+                    key = wiki_jobs.suggestion_dedupe_key("attach", target, [orphan_id], [])
+                    sid = wiki_jobs.insert_suggestion(
+                        conn, job_type="attach", target_wiki_id=target,
+                        entity_ids=[orphan_id], dedupe_key=key, rationale=rationale,
+                        proposed_name=None, batch_id=batch_id)
+                    wiki_jobs.finish_job(conn, job_id, "done", rationale)
+                    outcome = {"action": "attach", "suggestion_id": sid, "target_wiki_id": target}
+
+            elif action == "create":
+                name = decision.get("proposed_name")
+                if not name:
+                    wiki_jobs.finish_job(conn, job_id, "failed", "create missing proposed_name")
+                    outcome = {"action": "create", "error": "missing proposed_name"}
+                else:
+                    key = wiki_jobs.suggestion_dedupe_key("create", None, [orphan_id], [])
+                    sid = wiki_jobs.insert_suggestion(
+                        conn, job_type="create", target_wiki_id=None,
+                        entity_ids=[orphan_id], dedupe_key=key, rationale=rationale,
+                        proposed_name=name, batch_id=batch_id)
+                    wiki_jobs.finish_job(conn, job_id, "done", rationale)
+                    outcome = {"action": "create", "suggestion_id": sid, "proposed_name": name}
+
+            elif action == "consolidate":
+                wiki_ids = [str(w) for w in (decision.get("consolidate_wiki_ids") or [])]
+                if len(wiki_ids) < 2:
+                    wiki_jobs.finish_job(conn, job_id, "failed", "consolidate needs >=2 wiki ids")
+                    outcome = {"action": "consolidate", "error": "need >=2 wiki ids"}
+                else:
+                    key = wiki_jobs.suggestion_dedupe_key("consolidate", None, [], wiki_ids)
+                    sid = wiki_jobs.insert_suggestion(
+                        conn, job_type="consolidate", target_wiki_id=None,
+                        entity_ids=wiki_ids, dedupe_key=key, rationale=rationale,
+                        proposed_name=None, batch_id=batch_id)
+                    # The orphan itself is still unconnected; closing 'done'
+                    # lets the next cron re-triage it after the merge.
+                    wiki_jobs.finish_job(conn, job_id, "done", rationale)
+                    outcome = {"action": "consolidate", "suggestion_id": sid, "wiki_ids": wiki_ids}
+
+            else:
+                wiki_jobs.finish_job(conn, job_id, "failed", f"unknown action {action!r}")
+                outcome = {"action": action, "error": "unknown action"}
+
+            log_activity(conn, "wiki_maintain", orphan["entity_type"], orphan_id,
+                         details={"job_id": job_id, **outcome})
+        except Exception as e:
+            logger.exception("maintainer persistence failed")
+            raise
+
+    return {"claimed": 1, "job_id": job_id, "result": outcome}
+
+
+def _members_block(members: list[dict]) -> str:
+    if not members:
+        return "(none)"
+    out = []
+    for m in members:
+        out.append(
+            f"- id: {m['id']}\n  type: {m['entity_type']}\n"
+            f"  keywords: {m.get('keywords') or []}\n"
+            f"  content: {(m.get('content') or '')[:1200]}"
+        )
+    return "\n".join(out)
+
+
+@router.post("/write")
+async def wiki_write():
+    """
+    Write/update ONE wiki (one target per call). The LLM authors the entire
+    body and may freely revise summary/disambiguation/scope/any section. No
+    content gate, no manifest, no code-built ledger. The only guarantees are
+    process/bookkeeping: the prior version is snapshotted (reversible) and
+    `summarises` relations are reconciled *additively* from the LLM's inline
+    refs. The LLM researches with its own tools before writing.
+    """
+    # 1. Pick + claim a bucket.
+    with get_conn() as conn:
+        bucket = wiki_jobs.next_write_bucket(conn)
+        if not bucket:
+            return {"written": 0, "message": "no pending create/attach jobs"}
+        mode = bucket["mode"]
+        jobs = bucket["jobs"]
+        job_ids = [str(j["id"]) for j in jobs]
+        lock_key = bucket["target_wiki_id"] or f"create:{job_ids[0]}"
+        if not wiki_jobs.try_wiki_lock(conn, lock_key):
+            return {"written": 0, "message": "target locked by another writer; retry later"}
+        claimed = wiki_jobs.claim_jobs(conn, job_ids)
+        if not claimed:
+            return {"written": 0, "message": "jobs no longer claimable"}
+
+        member_ids: list[str] = []
+        for j in jobs:
+            member_ids.extend(j["entity_ids"])
+        dupes: list[dict] = []
+        if mode == "attach":
+            members = wiki_jobs.fetch_members(conn, member_ids)
+            wiki = wiki_jobs.fetch_wiki(conn, bucket["target_wiki_id"])
+            if not wiki:
+                wiki_jobs.finish_jobs(conn, job_ids, "failed", "target wiki missing")
+                return {"written": 0, "result": "failed", "reason": "target wiki missing"}
+            canonical = wiki["canonical_name"]
+            old_body = wiki["content"] or ""
+        elif mode == "consolidate":
+            members = []
+            dupes = wiki_jobs.fetch_wikis_for_merge(conn, bucket["wiki_ids"])
+            if len(dupes) < 2:
+                wiki_jobs.finish_jobs(conn, job_ids, "failed",
+                                      "fewer than 2 live wikis to consolidate")
+                return {"written": 0, "result": "failed", "reason": "nothing to merge"}
+            canonical = "(decide among duplicates)"
+            wiki = None
+            old_body = "\n\n".join(d["content"] or "" for d in dupes)
+        else:  # create
+            members = wiki_jobs.fetch_members(conn, member_ids)
+            canonical = bucket["proposed_name"] or "Untitled"
+            wiki = None
+            old_body = ""
+        batch_id = str(jobs[0].get("batch_id")) if jobs[0].get("batch_id") else None
+
+    def _dupes_block(ds: list[dict]) -> str:
+        if not ds:
+            return "(n/a)"
+        return "\n".join(
+            f"- wiki_id: {d['id']}\n  canonical_name: {d['canonical_name']}\n"
+            f"  importance: {d['importance']}  revision: {d['revision']}\n"
+            f"  body:\n{(d['content'] or '')[:3000]}" for d in ds
+        )
+
+    # 2. One focused agent call.
+    prompt = (
+        _WRITER_PROMPT
+        .replace("%%MODE%%", mode)
+        .replace("%%CANONICAL%%", canonical)
+        .replace("%%WIKI_ID%%", bucket["target_wiki_id"] or "(assigned after write)")
+        .replace("%%MEMBERS%%", _members_block(members))
+        .replace("%%CURRENT_BODY%%", old_body or "(none — create mode)")
+        .replace("%%DUPLICATES%%", _dupes_block(dupes))
+    )
+    # Generous turns so the writer can recall_memory / view_tree / delegate a
+    # subagent to research and verify before writing.
+    try:
+        agent_out = await run_agent_query(prompt, max_turns=30)
+        answer = agent_out.get("answer", "")
+    except Exception as e:
+        logger.exception("writer agent failed")
+        with get_conn() as conn:
+            disp = wiki_jobs.release_or_fail_jobs(conn, job_ids, f"agent error: {e}")
+        return {"written": 0, "result": disp, "reason": str(e)}
+
+    # The LLM returns ONLY the body. Consolidate also emits a single command
+    # line `<<<CANONICAL: wiki_id>>>` (a command, not page content) naming the
+    # survivor it chose.
+    new_body = _between(answer, "<<<WIKI_BODY>>>", "<<<END_WIKI_BODY>>>")
+    if not new_body:
+        with get_conn() as conn:
+            disp = wiki_jobs.release_or_fail_jobs(
+                conn, job_ids, f"no WIKI_BODY block returned: {answer[:300]}")
+        return {"written": 0, "result": disp, "reason": "no body returned"}
+
+    # 3. Persist (one transaction). No content gate — the LLM's body is
+    #    authoritative; we only snapshot (reversible) and reconcile additively.
+    with get_conn() as conn:
+        summary, disambig = wiki_jobs.extract_summary_disambig(new_body)
+        kw = wiki_jobs.keywords_from_meta(new_body)
+        retired: list[str] = []
+        if mode == "create":
+            wiki_id = wiki_jobs.create_wiki_entity(
+                conn, canonical, new_body, summary, disambig, member_ids,
+                keywords=kw)
+            revision = 1
+        elif mode == "consolidate":
+            canonical_id = (_between(answer, "<<<CANONICAL:", ">>>") or "").strip()
+            dupe_ids = {d["id"] for d in dupes}
+            if canonical_id not in dupe_ids:
+                disp = wiki_jobs.release_or_fail_jobs(
+                    conn, job_ids,
+                    f"<<<CANONICAL>>> {canonical_id!r} not among the duplicates")
+                return {"written": 0, "result": disp,
+                        "reason": "invalid or missing CANONICAL signal"}
+            wiki_id = canonical_id
+            for d in dupes:
+                wiki_jobs.snapshot_revision(
+                    conn, d["id"], d["content"] or "",
+                    wiki_jobs.parse_refs(d["content"] or ""), d["revision"])
+            revision = wiki_jobs.finalize_wiki_write(
+                conn, wiki_id, new_body, summary, disambig, member_ids)
+            for d in dupes:
+                if d["id"] != canonical_id:
+                    wiki_jobs.soft_retire_wiki(conn, d["id"], canonical_id, None)
+                    retired.append(d["id"])
+        else:  # attach
+            wiki_id = bucket["target_wiki_id"]
+            wiki_jobs.snapshot_revision(
+                conn, wiki_id, old_body, wiki_jobs.parse_refs(old_body),
+                wiki["revision"])
+            revision = wiki_jobs.finalize_wiki_write(
+                conn, wiki_id, new_body, summary, disambig, member_ids)
+
+        rel = wiki_jobs.reconcile_summarises_additive(conn, wiki_id, new_body)
+
+        wiki_jobs.finish_jobs(conn, job_ids, "done")
+        log_activity(conn, "wiki_write", "wiki", wiki_id, details={
+            "mode": mode, "revision": revision, "jobs": job_ids,
+            "members": len(member_ids), "retired": retired, **rel,
+        })
+
+    return {"written": 1, "wiki_id": wiki_id, "mode": mode,
+            "revision": revision, "jobs": job_ids, "retired": retired, **rel}
+
+
+def _is_wiki(conn, entity_id: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM entities WHERE id = %s AND entity_type = 'wiki'", (str(entity_id),))
+        return cur.fetchone() is not None
+
+
+@router.get("/jobs")
+def wiki_jobs_list(
+    status: str | None = Query(default=None),
+    job_type: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    with get_conn() as conn:
+        return wiki_jobs.list_jobs(conn, status, job_type, limit)

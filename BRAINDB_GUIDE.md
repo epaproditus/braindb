@@ -277,8 +277,14 @@ curl "http://localhost:8000/api/v1/memory/log?since=2026-04-08T00:00:00Z"
 
 Response includes: `id`, `timestamp`, `operation`, `entity_type`, `entity_id`, `details`, `context_note`.
 
-### Read-only SQL
-For ad-hoc exploration. Only `SELECT` and `WITH` queries; 5s timeout; 1000 row limit.
+### Read-only SQL — EXCEPTION tool, not for recall
+
+⚠ This is **not** a recall/discovery path. A flat SELECT has no embeddings, no
+graph, no ranking — it discards everything BrainDB is built for. Default to
+`POST /api/v1/memory/context` (and delegated `/api/v1/agent/query`) for all
+recall, discovery, and understanding. Use `/memory/sql` **only** for a
+specific structured/aggregate question those cannot express (counts, GROUP BY,
+activity-log joins). Only `SELECT` and `WITH` queries; 5s timeout; 1000 row limit.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/memory/sql \

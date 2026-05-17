@@ -26,6 +26,7 @@ DECAY_RATES = {
     "source":     settings.decay_rate_source,
     "datasource": settings.decay_rate_datasource,
     "rule":       settings.decay_rate_rule,
+    "wiki":       settings.decay_rate_wiki,
 }
 
 
@@ -49,6 +50,7 @@ EXT_QUERIES = {
     "source":     ("sources_ext",     "entity_id, url, domain, http_status, last_checked_at"),
     "datasource": ("datasources_ext", "entity_id, file_path, url, content_hash, word_count, language"),
     "rule":       ("rules_ext",       "entity_id, always_on, category, priority, is_active"),
+    "wiki":       ("wikis_ext",       "entity_id, canonical_name, disambiguation, language, member_keyword_ids::text[] AS member_keyword_ids, revision, last_synthesised_at, retired_at, redirect_to"),
 }
 
 

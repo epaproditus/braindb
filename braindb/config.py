@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     decay_rate_source: float = 0.002
     decay_rate_datasource: float = 0.001
     decay_rate_rule: float = 0.0
+    decay_rate_wiki: float = 0.0   # synthesised pages should not fade
 
     # Graph traversal
     max_graph_depth: int = 3

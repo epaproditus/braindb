@@ -1,0 +1,508 @@
+"""
+Wiki job queue — non-destructive plumbing only.
+
+This module is deliberately free of any search/scoring/LLM logic (constraint
+C3): finding *what* to wiki-ify and *how* to write it is delegated to the
+existing recall/agent infra by the routers. Here we only:
+
+  * detect orphans with one read-only SQL pass (no scoring),
+  * enqueue exactly one `triage` job per orphan (idempotent),
+  * list jobs.
+
+Claim / status-transition / advisory-lock / accounted-change-gate helpers are
+added in later steps, alongside the endpoints that use them.
+"""
+import re
+import uuid
+
+import psycopg2.extras
+
+ACTIVE_STATUSES = ("pending", "assigned")
+
+# Inline reference token: [[ref:UUID]] or [[ref:UUID|display text]]
+REF_RE = re.compile(
+    r"\[\[ref:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\|[^\]]*)?\]\]"
+)
+
+SUMMARY_RE = re.compile(r">\s*\*\*Summary:\*\*\s*(.+)")
+DISAMBIG_RE = re.compile(r">\s*\*\*Disambiguation:\*\*\s*(.+)")
+# The LLM authors its own meta header line; we only READ what it declared.
+META_KEYWORDS_RE = re.compile(r"<!--\s*wiki:meta[^>]*\bkeywords=([^>]+?)\s*-->")
+
+
+def parse_refs(body: str) -> set[str]:
+    """All entity UUIDs cited inline in the body (lower-cased)."""
+    return {m.lower() for m in REF_RE.findall(body or "")}
+
+
+def keywords_from_meta(body: str) -> list[str]:
+    """Read keywords the LLM declared in its own `<!-- wiki:meta ... -->`
+    header (e.g. `keywords=a;b;c`). Reading the LLM's declaration is not code
+    authoring content. Returns [] if the LLM declared none."""
+    m = META_KEYWORDS_RE.search(body or "")
+    if not m:
+        return []
+    raw = m.group(1).replace(",", ";")
+    return [k.strip() for k in raw.split(";") if k.strip()]
+
+
+def snapshot_revision(conn, wiki_id: str, old_content: str, old_refs: set[str],
+                      revision: int) -> None:
+    """Persist the prior body+refs before mutation so any change is reversible."""
+    from braindb.services.activity_log import log_activity
+    log_activity(conn, "wiki_revise", "wiki", wiki_id, details={
+        "from_revision": revision,
+        "prior_content": old_content,
+        "prior_refs": sorted(old_refs),
+    })
+
+
+def reconcile_summarises_additive(conn, wiki_id: str, body: str) -> dict:
+    """
+    Pure bookkeeping: ensure a `wiki --summarises--> e` relation exists for
+    every entity the LLM cited inline (`[[ref:UUID]]`). ADDITIVE ONLY — it
+    never deletes or re-types a relation behind the LLM. If the LLM wants a
+    relation gone it calls `delete_relation` itself. Mirrors LLM-authored
+    content into the graph; it does not judge or shape content.
+    """
+    cited = parse_refs(body)
+    added = 0
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT to_entity_id::text FROM relations "
+            "WHERE from_entity_id = %s AND relation_type = 'summarises'",
+            (wiki_id,),
+        )
+        current = {r[0].lower() for r in cur.fetchall()}
+        for e in cited - current:
+            cur.execute(
+                """INSERT INTO relations
+                   (from_entity_id, to_entity_id, relation_type, relevance_score, description)
+                   VALUES (%s, %s, 'summarises', 0.9, 'wiki body reference')
+                   ON CONFLICT (from_entity_id, to_entity_id, relation_type) DO NOTHING""",
+                (wiki_id, e),
+            )
+            added += 1
+    return {"relations_added": added, "relations_removed": 0}
+
+
+def try_wiki_lock(conn, key: str) -> bool:
+    """Transaction-scoped advisory lock so two writers never touch one wiki."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_xact_lock(hashtext(%s))", (f"wiki:{key}",))
+        return bool(cur.fetchone()[0])
+
+
+def claim_jobs(conn, job_ids: list[str]) -> int:
+    """Mark a bucket's pending suggestion jobs as assigned (SKIP LOCKED)."""
+    if not job_ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE wiki_job SET status='assigned', assigned_at=now(), attempts=attempts+1
+               WHERE id = ANY(%s::uuid[]) AND status='pending'
+                 AND id IN (SELECT id FROM wiki_job WHERE id = ANY(%s::uuid[])
+                            FOR UPDATE SKIP LOCKED)""",
+            (job_ids, job_ids),
+        )
+        return cur.rowcount
+
+# Entity types the cron considers "wiki-able" content. Keywords act as concept
+# hubs; thoughts/facts are the substance. (wiki/source/datasource/rule excluded.)
+ORPHAN_ENTITY_TYPES = ("keyword", "thought", "fact")
+
+
+def run_cron(conn) -> dict:
+    """
+    Find entities not yet connected to any wiki and enqueue one `triage`
+    job per orphan. Pure SQL, read-only except the additive job insert.
+
+    An orphan is an entity of an ORPHAN_ENTITY_TYPES type that:
+      * is not the target of a `wiki --summarises--> e` relation,
+      * is not listed in any wiki's `member_keyword_ids`,
+      * is not already referenced by an active (pending/assigned) wiki_job.
+
+    Idempotent: the partial-unique index on `dedupe_key WHERE status IN
+    ('pending','assigned')` + ON CONFLICT DO NOTHING means re-running cron
+    never creates duplicate triage jobs.
+    """
+    batch_id = str(uuid.uuid4())
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            WITH orphans AS (
+                SELECT e.id
+                FROM entities e
+                WHERE e.entity_type = ANY(%s)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM relations r
+                      JOIN entities w ON w.id = r.from_entity_id AND w.entity_type = 'wiki'
+                      WHERE r.relation_type = 'summarises' AND r.to_entity_id = e.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wikis_ext wx WHERE e.id = ANY(wx.member_keyword_ids)
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wiki_job j
+                      WHERE j.status IN ('pending','assigned')
+                        AND e.id = ANY(j.entity_ids)
+                  )
+                  -- skip self-clearing: a deliberate maintainer 'skip' closes
+                  -- the triage as 'rejected'. Never re-enqueue those (mirrors
+                  -- not_duplicate permanence). 'failed' triage (transient
+                  -- provider errors) is intentionally NOT excluded so it retries.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wiki_job j
+                      WHERE j.job_type = 'triage' AND j.status = 'rejected'
+                        AND e.id = ANY(j.entity_ids)
+                  )
+            )
+            INSERT INTO wiki_job (job_type, status, entity_ids, dedupe_key, batch_id)
+            SELECT 'triage', 'pending', ARRAY[o.id], 'triage:' || o.id::text, %s::uuid
+            FROM orphans o
+            ON CONFLICT (dedupe_key) WHERE status IN ('pending','assigned')
+            DO NOTHING
+            RETURNING id
+            """,
+            (list(ORPHAN_ENTITY_TYPES), batch_id),
+        )
+        enqueued = cur.rowcount
+
+        # Counts for visibility (cheap; the heavy filter already ran above).
+        cur.execute(
+            "SELECT count(*) AS c FROM wiki_job WHERE status = 'pending' AND job_type = 'triage'"
+        )
+        pending_triage = cur.fetchone()["c"]
+
+    return {
+        "batch_id": batch_id,
+        "triage_jobs_enqueued": enqueued,
+        "pending_triage_total": pending_triage,
+    }
+
+
+def claim_one_triage(conn) -> dict | None:
+    """
+    Atomically claim a single pending triage job (C1: one case per call).
+    FOR UPDATE SKIP LOCKED guarantees two concurrent maintainer calls never
+    grab the same case.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            UPDATE wiki_job
+               SET status = 'assigned', assigned_at = now(), attempts = attempts + 1
+             WHERE id = (
+                 SELECT id FROM wiki_job
+                  WHERE status = 'pending' AND job_type = 'triage'
+                  ORDER BY created_at
+                  FOR UPDATE SKIP LOCKED
+                  LIMIT 1
+             )
+            RETURNING id, entity_ids::text[] AS entity_ids, batch_id
+            """
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def finish_job(conn, job_id: str, status: str, last_error: str | None = None) -> None:
+    """Transition a job to a terminal state (done / rejected / failed)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE wiki_job SET status = %s, completed_at = now(), last_error = %s WHERE id = %s",
+            (status, last_error, str(job_id)),
+        )
+
+
+def fetch_entity_brief(conn, entity_id: str) -> dict | None:
+    """Minimal entity view for building a focused maintainer prompt."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, entity_type, content, summary, keywords FROM entities WHERE id = %s",
+            (str(entity_id),),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def suggestion_dedupe_key(action: str, target_wiki_id: str | None,
+                          entity_ids: list[str], consolidate_wiki_ids: list[str]) -> str:
+    """Deterministic, service-computed (never LLM-computed) idempotency key."""
+    if action == "attach":
+        return f"attach:{target_wiki_id}:" + ",".join(sorted(entity_ids))
+    if action == "create":
+        return "create:" + ",".join(sorted(entity_ids))
+    if action == "consolidate":
+        return "consolidate:" + ",".join(sorted(consolidate_wiki_ids))
+    raise ValueError(f"unknown action {action!r}")
+
+
+def insert_suggestion(conn, *, job_type: str, target_wiki_id: str | None,
+                      entity_ids: list[str], dedupe_key: str, rationale: str | None,
+                      proposed_name: str | None, batch_id: str | None) -> str | None:
+    """
+    Insert a maintainer suggestion job. ON CONFLICT DO NOTHING against the
+    partial-unique active dedupe index → re-proposing the same work is a no-op.
+    Returns the new job id, or None if it was a duplicate.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO wiki_job
+                (job_type, status, target_wiki_id, entity_ids, dedupe_key,
+                 rationale, proposed_name, batch_id)
+            VALUES (%s, 'pending', %s, %s::uuid[], %s, %s, %s, %s)
+            ON CONFLICT (dedupe_key) WHERE status IN ('pending','assigned')
+            DO NOTHING
+            RETURNING id
+            """,
+            (job_type, target_wiki_id, entity_ids, dedupe_key,
+             rationale, proposed_name, batch_id),
+        )
+        row = cur.fetchone()
+        return str(row[0]) if row else None
+
+
+def next_write_bucket(conn) -> dict | None:
+    """
+    Pick the next unit of writer work (one wiki per call). A `create` job is
+    its own bucket; `attach` jobs are grouped by target_wiki_id so the writer
+    sees every new member of a wiki at once. Consolidate is handled by Step 5.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, job_type, target_wiki_id, entity_ids::text[] AS entity_ids,
+                      proposed_name, rationale, batch_id
+               FROM wiki_job
+               WHERE status='pending' AND job_type IN ('create','attach','consolidate')
+               ORDER BY created_at LIMIT 1"""
+        )
+        seed = cur.fetchone()
+        if not seed:
+            return None
+        seed = dict(seed)
+        if seed["job_type"] == "create":
+            return {"mode": "create", "jobs": [seed],
+                    "target_wiki_id": None, "proposed_name": seed["proposed_name"]}
+        if seed["job_type"] == "consolidate":
+            # entity_ids holds the wiki ids the maintainer flagged as duplicates.
+            return {"mode": "consolidate", "jobs": [seed],
+                    "target_wiki_id": None, "proposed_name": None,
+                    "wiki_ids": seed["entity_ids"]}
+        cur.execute(
+            """SELECT id, entity_ids::text[] AS entity_ids
+               FROM wiki_job
+               WHERE status='pending' AND job_type='attach'
+                 AND target_wiki_id = %s
+               ORDER BY created_at""",
+            (seed["target_wiki_id"],),
+        )
+        jobs = [dict(r) for r in cur.fetchall()]
+        return {"mode": "attach", "jobs": jobs,
+                "target_wiki_id": str(seed["target_wiki_id"]), "proposed_name": None}
+
+
+def fetch_members(conn, entity_ids: list[str]) -> list[dict]:
+    if not entity_ids:
+        return []
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id::text AS id, entity_type, content, keywords "
+            "FROM entities WHERE id = ANY(%s::uuid[])",
+            (entity_ids,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def fetch_wiki(conn, wiki_id: str) -> dict | None:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT e.id::text AS id, e.content, w.canonical_name, w.revision,
+                      w.member_keyword_ids::text[] AS member_keyword_ids
+               FROM entities e JOIN wikis_ext w ON w.entity_id = e.id
+               WHERE e.id = %s""",
+            (str(wiki_id),),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def release_or_fail_jobs(conn, job_ids: list[str], last_error: str,
+                         max_attempts: int = 3) -> str:
+    """On a gate failure: return jobs to 'pending' for retry, or 'failed' once
+    attempts are exhausted (surfaced via GET /jobs — never a silent bad write)."""
+    if not job_ids:
+        return "none"
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE wiki_job
+                  SET status = CASE WHEN attempts >= %s THEN 'failed' ELSE 'pending' END,
+                      last_error = %s
+                WHERE id = ANY(%s::uuid[])""",
+            (max_attempts, last_error[:1000], job_ids),
+        )
+    return "failed" if _max_attempts_reached(conn, job_ids, max_attempts) else "requeued"
+
+
+def _max_attempts_reached(conn, job_ids: list[str], max_attempts: int) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT bool_or(status='failed') FROM wiki_job WHERE id = ANY(%s::uuid[])",
+            (job_ids,),
+        )
+        return bool(cur.fetchone()[0])
+
+
+def finish_jobs(conn, job_ids: list[str], status: str, last_error: str | None = None) -> None:
+    if not job_ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE wiki_job SET status=%s, completed_at=now(), last_error=%s "
+            "WHERE id = ANY(%s::uuid[])",
+            (status, last_error, job_ids),
+        )
+
+
+def create_wiki_entity(conn, canonical_name: str, body: str, summary: str | None,
+                       disambiguation: str | None, member_entity_ids: list[str],
+                       keywords: list[str] | None = None) -> str:
+    """Scaffolding only — a new wiki page is additive, not destruction. The
+    body, summary, disambiguation, and keywords are ALL the LLM's: `keywords`
+    is whatever the LLM declared in its meta header (may be empty). Code never
+    invents keywords (no `[canonical_name]` default)."""
+    from braindb.services.embedding_service import get_embedding_service
+    from braindb.services.keyword_service import (
+        ensure_keyword_entities, link_entity_to_keywords,
+    )
+    kws = [k.strip() for k in (keywords or []) if k and k.strip()]
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO entities (entity_type, title, content, summary, keywords,
+                                     importance, source)
+               VALUES ('wiki', %s, %s, %s, %s, 0.9, 'agent-inference')
+               RETURNING id""",
+            (canonical_name, body, summary, kws),
+        )
+        wid = str(cur.fetchone()[0])
+    if kws:
+        kw_map = ensure_keyword_entities(conn, kws, get_embedding_service())
+        link_entity_to_keywords(conn, wid, list(kw_map.values()))
+    member_kw = _keyword_ids_among(conn, member_entity_ids)
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO wikis_ext
+                   (entity_id, canonical_name, disambiguation, language,
+                    member_keyword_ids, revision, last_synthesised_at)
+               VALUES (%s, %s, %s, 'en', %s::uuid[], 1, now())""",
+            (wid, canonical_name, disambiguation, member_kw),
+        )
+    return wid
+
+
+def _keyword_ids_among(conn, entity_ids: list[str]) -> list[str]:
+    if not entity_ids:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id::text FROM entities "
+            "WHERE id = ANY(%s::uuid[]) AND entity_type='keyword'",
+            (entity_ids,),
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def finalize_wiki_write(conn, wiki_id: str, new_body: str, summary: str | None,
+                        disambiguation: str | None, member_entity_ids: list[str]) -> int:
+    """Apply the gated body to an existing wiki: update content + header
+    fields, union new keyword members, bump revision."""
+    new_kw = _keyword_ids_among(conn, member_entity_ids)
+    with conn.cursor() as cur:
+        cur.execute("UPDATE entities SET content=%s, summary=%s WHERE id=%s",
+                    (new_body, summary, wiki_id))
+        cur.execute(
+            """UPDATE wikis_ext
+                  SET disambiguation = COALESCE(%s, disambiguation),
+                      member_keyword_ids = (
+                          SELECT ARRAY(SELECT DISTINCT unnest(
+                              member_keyword_ids || %s::uuid[]))),
+                      revision = revision + 1,
+                      last_synthesised_at = now()
+                WHERE entity_id = %s
+              RETURNING revision""",
+            (disambiguation, new_kw, wiki_id),
+        )
+        return cur.fetchone()[0]
+
+
+def fetch_wikis_for_merge(conn, wiki_ids: list[str]) -> list[dict]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT e.id::text AS id, e.content, e.importance, w.canonical_name,
+                      w.revision, w.member_keyword_ids::text[] AS member_keyword_ids,
+                      w.retired_at
+               FROM entities e JOIN wikis_ext w ON w.entity_id = e.id
+               WHERE e.id = ANY(%s::uuid[]) AND e.entity_type='wiki'""",
+            (wiki_ids,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def soft_retire_wiki(conn, loser_id: str, canonical_id: str, note: str | None) -> None:
+    """LLM-decided retirement, executed deterministically + reversibly: the
+    loser drops out of ranking (importance 0) but still resolves; provenance
+    is kept via duplicate_of / consolidated_into edges (which also self-clear
+    the maintainer's dedup, since it is prompted to skip marked pairs)."""
+    from braindb.services.activity_log import log_activity
+    with conn.cursor() as cur:
+        cur.execute("UPDATE entities SET importance = 0.0 WHERE id = %s", (loser_id,))
+        cur.execute(
+            "UPDATE wikis_ext SET retired_at = now(), redirect_to = %s WHERE entity_id = %s",
+            (canonical_id, loser_id),
+        )
+        for rtype in ("duplicate_of", "consolidated_into"):
+            cur.execute(
+                """INSERT INTO relations
+                   (from_entity_id, to_entity_id, relation_type, relevance_score, description)
+                   VALUES (%s, %s, %s, 0.0, %s)
+                   ON CONFLICT (from_entity_id, to_entity_id, relation_type) DO NOTHING""",
+                (loser_id, canonical_id, rtype, (note or "merged")[:500]),
+            )
+    log_activity(conn, "wiki_merge", "wiki", canonical_id,
+                 details={"retired": loser_id, "canonical": canonical_id, "note": note})
+
+
+def extract_summary_disambig(body: str) -> tuple[str | None, str | None]:
+    sm = SUMMARY_RE.search(body or "")
+    dm = DISAMBIG_RE.search(body or "")
+    return (sm.group(1).strip() if sm else None,
+            dm.group(1).strip() if dm else None)
+
+
+def list_jobs(conn, status: str | None, job_type: str | None, limit: int) -> list[dict]:
+    conditions, params = [], []
+    if status:
+        conditions.append("status = %s")
+        params.append(status)
+    if job_type:
+        conditions.append("job_type = %s")
+        params.append(job_type)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT id, job_type, status, target_wiki_id,
+                   entity_ids::text[] AS entity_ids, dedupe_key, rationale,
+                   proposed_name, batch_id, created_at, assigned_at,
+                   completed_at, attempts, last_error
+            FROM wiki_job
+            {where}
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
