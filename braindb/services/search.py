@@ -6,7 +6,34 @@ Uses a 4-tier scoring system:
   3. Content trigram similarity    — weight 0.5
   4. Title trigram similarity      — weight 0.3
 """
+import os
+
 import psycopg2.extras
+
+# ------------------------------------------------------------------ #
+# Central content-preview helper (shared by recall/search/list/etc.)  #
+# ------------------------------------------------------------------ #
+# Lives here because search.py is a dependency-free leaf module that
+# context.py and the agent tools already import — so this is reused, not
+# a new module. The ONLY full-content read is get_entity(<id>); every
+# multi-item path renders previews so big/polluted bodies never flood
+# (or pollute) the caller's context.
+PREVIEW_CAP = int(os.getenv("BRAINDB_PREVIEW_CAP", "1024"))  # <= 1K per item
+
+
+def preview(text, entity_id=None, cap: int = PREVIEW_CAP) -> str:
+    """Bound a content string to `cap` chars; if cut, append the standard
+    marker + drill-down protocol so the LLM knows how to read the full body."""
+    s = "" if text is None else str(text)
+    if len(s) <= cap:
+        return s
+    extra = len(s) - cap
+    how = f' full body: get_entity("{entity_id}").' if entity_id else "."
+    return (
+        s[:cap]
+        + f"\n--truncated ({extra} more chars)--{how} If large, "
+        "delegate_to_subagent to read/extract it without polluting this context."
+    )
 
 
 # Shared SQL fragments
@@ -71,4 +98,10 @@ def fuzzy_search(conn, query: str, entity_types: list[str] | None, min_importanc
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(sql, params)
-        return [dict(r) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+    # Central preview cap — covers /memory/search + quick_search (and the
+    # text seeds feeding /memory/context). Real content is read only via
+    # get_entity(<id>) (the full carve-out).
+    for r in rows:
+        r["content"] = preview(r.get("content"), r.get("id"))
+    return rows

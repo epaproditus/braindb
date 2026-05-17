@@ -34,7 +34,7 @@ from braindb.services.keyword_service import (
     link_entity_to_keywords,
     sync_keywords_for_entity,
 )
-from braindb.services.search import fuzzy_search
+from braindb.services.search import fuzzy_search, preview
 
 logger = logging.getLogger(__name__)
 
@@ -382,7 +382,7 @@ async def list_entities(
             lines.append(
                 f"[{r['entity_type']}] imp={r['importance']} src={r.get('source', '-')}\n"
                 f"  id: {r['id']}\n"
-                f"  content: {r['content']}\n"
+                f"  content: {preview(r['content'], r['id'])}\n"
                 f"  keywords: {r.get('keywords', [])}"
             )
         return _truncate("\n".join(lines))
@@ -632,7 +632,9 @@ async def search_sql(query: str) -> str:
                 columns = [d[0] for d in cur.description] if cur.description else []
                 rows = cur.fetchmany(1000)
             log_activity(conn, "sql_query", details={"query": query[:500], "rows": len(rows)})
-        result = {"columns": columns, "rows": [[str(v) if v is not None else None for v in r] for r in rows], "row_count": len(rows)}
+        result = {"columns": columns,
+                  "rows": [[preview(v) if v is not None else None for v in r] for r in rows],
+                  "row_count": len(rows)}
         return _truncate(json.dumps(result, default=str, indent=2))
     except Exception as e:
         return _err(str(e))

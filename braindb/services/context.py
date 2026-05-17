@@ -18,7 +18,7 @@ from braindb.schemas.search import ContextRequest, ContextResponse, SearchResult
 from braindb.services.embedding_service import get_embedding_service
 from braindb.services.graph import graph_expand
 from braindb.services.keyword_service import find_entities_for_keywords, find_similar_keywords
-from braindb.services.search import fuzzy_search
+from braindb.services.search import fuzzy_search, preview
 
 DECAY_RATES = {
     "thought":    settings.decay_rate_thought,
@@ -113,7 +113,7 @@ def _to_item(row: dict, search_score: float, depth: int, relevance: float, ext: 
         id=row["id"],
         entity_type=row["entity_type"],
         title=row.get("title"),
-        content=row["content"],
+        content=preview(row.get("content"), row.get("id")),
         summary=row.get("summary"),
         keywords=row.get("keywords") or [],
         importance=row["importance"],
