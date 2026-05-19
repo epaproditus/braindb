@@ -88,8 +88,16 @@ honour it.
    you see duplicates while researching, you MUST propose this.
 4. **attach** — an existing wiki already covers this subject (under any
    name variant), or the seed is a narrow fact about an already-wikied
-   broad subject. Give that wiki's id. A narrow fact about an existing
-   subject is ALWAYS an attach, never a new page.
+   broad subject. A narrow fact about an existing subject is ALWAYS an
+   attach, never a new page.
+   **Grounding the id (hard rule — do NOT skip):** `target_wiki_id` MUST be
+   an id you literally saw in THIS session's tool output — from
+   `recall_memory` or from `list_entities(entity_type='wiki')` — and that
+   you then confirmed by calling `get_entity(<that id>)` and seeing
+   `entity_type` = `wiki`. NEVER write a UUID from memory, pattern, or
+   guess; an unverified id is worthless and will be rejected. If you
+   believe a wiki exists but cannot produce a tool-seen, get_entity-verified
+   wiki id for it, you may NOT choose `attach` — continue down to step 5.
 5. **create** — ONLY if steps 1-4 do not apply: recall genuinely shows no
    existing wiki for this subject under any variant, AND the evidence
    supports a clear, explicitly-named subject and scope. Give the canonical
