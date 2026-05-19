@@ -16,12 +16,18 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
 API_URL = os.getenv("BRAINDB_API_URL", "http://localhost:8000")
 INTERVAL = int(os.getenv("WIKI_INTERVAL", "60"))          # one cadence, like the watcher
 DRAIN_MAX = int(os.getenv("WIKI_DRAIN_MAX", "20"))        # safety bound on /write per tick
+# Per-tick concurrency: how many /wiki/write calls fire in parallel (vLLM
+# continuous-batches them on the GPU; the DB layer is already safe via
+# FOR UPDATE SKIP LOCKED on every claim and try_wiki_lock per wiki).
+# `maintain` runs concurrently alongside writers (1 maintain in flight, C1).
+WRITE_PARALLELISM = int(os.getenv("WIKI_WRITE_PARALLELISM", "3"))
 AGENT_TIMEOUT = int(os.getenv("WIKI_AGENT_TIMEOUT", "600"))
 
 logging.basicConfig(
@@ -98,20 +104,34 @@ def main() -> None:
             # 2. cheap gate — decide whether any LLM work is warranted.
             has_triage, has_sugg = _pending_kinds()
 
-            # 3. one maintain case (C1) only if there is triage to do.
-            if has_triage:
-                res = _post("/api/v1/wiki/maintain", timeout=AGENT_TIMEOUT)
-                if res and res.get("claimed"):
-                    log.info("maintain: %s", res.get("result"))
-
-            # 4. drain the write queue (bounded) only if suggestions exist.
-            if has_sugg:
-                for _ in range(DRAIN_MAX):
-                    res = _post("/api/v1/wiki/write", timeout=AGENT_TIMEOUT)
-                    if not res or not res.get("written"):
-                        break
-                    log.info("write: wiki=%s mode=%s rev=%s",
-                             res.get("wiki_id"), res.get("mode"), res.get("revision"))
+            # 3+4. fan out: ONE maintain (C1) in parallel with up to
+            # WRITE_PARALLELISM writes per batch; drain writes in batches
+            # until empty or DRAIN_MAX. The DB locks make this safe:
+            #   FOR UPDATE SKIP LOCKED -> no double-claim on triage/suggestion
+            #   try_wiki_lock(wiki_id)  -> same-wiki writer contenders skip
+            # vLLM continuous-batches the concurrent inferences on the GPU.
+            with ThreadPoolExecutor(max_workers=WRITE_PARALLELISM + 1) as pool:
+                maintain_f = (pool.submit(_post, "/api/v1/wiki/maintain", AGENT_TIMEOUT)
+                              if has_triage else None)
+                done = 0
+                while has_sugg and done < DRAIN_MAX:
+                    batch = min(WRITE_PARALLELISM, DRAIN_MAX - done)
+                    fs = [pool.submit(_post, "/api/v1/wiki/write", AGENT_TIMEOUT)
+                          for _ in range(batch)]
+                    any_written = False
+                    for f in fs:
+                        res = f.result()
+                        done += 1
+                        if res and res.get("written"):
+                            any_written = True
+                            log.info("write: wiki=%s mode=%s rev=%s",
+                                     res.get("wiki_id"), res.get("mode"), res.get("revision"))
+                    if not any_written:
+                        break  # queue empty or all targets locked -> stop draining
+                if maintain_f is not None:
+                    res = maintain_f.result()
+                    if res and res.get("claimed"):
+                        log.info("maintain: %s", res.get("result"))
 
             # 5. nothing pending -> no LLM call happened this tick (free).
         except Exception as e:
