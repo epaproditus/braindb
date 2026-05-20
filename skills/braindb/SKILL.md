@@ -101,7 +101,12 @@ to flat SQL.
    summary.
 3. `GET /api/v1/entities…`, `GET /api/v1/memory/tree/<id>`,
    `GET /api/v1/entities/<id>/relations` — targeted structure lookups.
-4. **`POST /api/v1/memory/sql` — exception only.** A flat SELECT has no
+4. **Wikis** — first-class entity type, curated topic pages assembled by an
+   internal maintainer + writer pipeline from facts/thoughts tagged with the
+   same keyword. To browse: `GET /api/v1/entities?entity_type=wiki`. Full body:
+   `GET /api/v1/entities/<id>`. Wikis also surface naturally in `/memory/context`.
+   Write paths are documented in the WIKIS section below.
+5. **`POST /api/v1/memory/sql` — exception only.** A flat SELECT has no
    embeddings/graph/ranking. Use it solely for a specific structured/aggregate
    question (counts, GROUP BY, activity-log joins) the above cannot express.
    **Never** for recall, discovery, similarity, or understanding.
@@ -181,13 +186,32 @@ Let recalled facts inform your response. **Do NOT announce** "I found in memory 
 
 ## SAVE — After Responding
 
-After each interaction, evaluate what you learned. **Be proactive and thorough about saving.**
+After each interaction, evaluate what you learned. The policy is **RECALL → ASK → SAVE.**
 
-### Saving philosophy
+### Saving philosophy — always ASK the user first
 
-- **Save everything worth remembering.** Don't skip something because it seems minor — save it with lower importance. A fact you didn't need is harmless. A fact you forgot is a missed opportunity.
-- **Create THOUGHTS proactively.** After each interaction, form inferences: what does this tell you about the user's expertise? Their working style? Their priorities? Thoughts are cheap and enrich the graph.
-- **Create RELATIONS for every new entity.** Connect it to existing entities found during recall. Multiple relations per entity is ideal — the graph's value comes from density.
+Always recall first. If what the user shared is **net-new** (not already in
+`/memory/context`), **ASK the user** before saving:
+
+> "I haven't seen this before — should I save it as a fact / thought / rule?
+> (I'd tag it with keywords X, Y; importance Z.)"
+
+Only persist after the user confirms. The user has the final say on what
+becomes long-term memory. Auto-saves without confirmation dilute signal and
+accumulate junk; user-confirmed memory is higher-signal and traceable.
+
+**Exception** — behavioural rules the user explicitly stated as rules ("from
+now on, always X"; "never do Y") can be saved without an extra confirmation —
+they already said it. Just surface the action: "Saving that as a rule."
+
+Once the user agrees:
+
+- **Create RELATIONS for every new entity.** Connect it to existing entities
+  found during recall. Multiple relations per entity is ideal — the graph's
+  value comes from density.
+- **Thoughts (your own inferences about the user) — ASK before persisting,
+  same as facts.** A thought is still memory; the user should agree it
+  belongs there.
 
 ### What to save as
 
@@ -364,6 +388,92 @@ curl -s -X POST http://localhost:8000/api/v1/memory/sql \
 
 Reiterate: `/memory/context` (+ delegated `/agent/query`) is the default for
 everything. `/memory/sql` is the rare exception for true aggregations only.
+
+---
+
+## WIKIS — Auto-Curated Topic Pages
+
+Wikis are canonical topic pages BrainDB assembles automatically from
+facts/thoughts tagged with the same keyword. An internal maintainer runs
+every 60s, scans for orphan keywords (a keyword with members but no wiki
+yet), and decides per-orphan: **attach** (the topic already has a wiki),
+**create** (mint a new one), **consolidate** (merge duplicates), or
+**skip** (not a wiki-worthy subject). Approved suggestions then become wiki
+bodies via the wiki writer. You usually don't need to do anything — saving
+facts with consistent keywords is enough; the pipeline materialises the
+wikis on its own.
+
+### Recall — browse and read wikis
+
+```bash
+# List all wikis (most recent first), previews only
+curl -s "http://localhost:8000/api/v1/entities?entity_type=wiki&limit=50"
+
+# Read a wiki body in full
+curl -s http://localhost:8000/api/v1/entities/<UUID>
+```
+
+Wikis surface in `/memory/context` automatically — you don't have to ask
+for them separately when doing topic recall.
+
+### Write — indirect (default): let the pipeline decide
+
+1. Save your facts with the right keyword (the subject's bare name —
+   `keywords=["Sawki"]`, not `["Sawki the employee"]`).
+2. (Optional) Nudge the pipeline so the maintainer evaluates the new
+   keyword *now* rather than on the next scheduler tick:
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/wiki/cron
+```
+
+The cron is **idempotent** (safe to call any time). It enqueues triage
+jobs for orphan keywords; the scheduler then runs maintain → write on
+its next 60s tick. The maintainer can still decide to **skip** the
+orphan if the subject isn't worth a wiki (e.g. an infrastructural
+keyword) — that's expected and not an error.
+
+Inspect what's pending:
+
+```bash
+curl -s "http://localhost:8000/api/v1/wiki/jobs?status=pending&limit=20"
+```
+
+### Write — direct (power user, rare): bypass the pipeline
+
+When you need full control over the body and you know exactly what the
+wiki should say, you can create one directly:
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/wikis \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "# Sawki\n\nFull markdown body here...",
+    "canonical_name": "Sawki",
+    "disambiguation": "Egyptian employee under Dimitrios Koutsoumpos",
+    "language": "en",
+    "member_keyword_ids": ["<keyword-uuid>"],
+    "keywords": ["Sawki", "Egypt", "Petros"],
+    "importance": 0.7,
+    "source": "user-stated"
+  }'
+```
+
+⚠ This **bypasses the maintainer's dedup logic.** If a wiki for that
+subject already exists, you'll create a duplicate that someone (or the
+next `consolidate` maintainer decision) has to clean up. Prefer the
+indirect path unless you specifically know why the pipeline can't do
+what you need.
+
+`member_keyword_ids` requires existing keyword UUIDs. Find them via:
+
+```bash
+curl -s "http://localhost:8000/api/v1/entities?entity_type=keyword&content=<name>"
+```
+
+We intentionally do NOT document `POST /wiki/maintain` or `POST
+/wiki/write` here — they're claim-based (take no target) and only make
+sense as scheduler-internal steps.
 
 ---
 

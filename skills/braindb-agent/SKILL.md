@@ -6,7 +6,7 @@ allowed-tools: Bash Read
 
 ## BrainDB Memory Agent
 
-BrainDB has its own internal agent (LiteLLM + NVIDIA NIM) that handles all memory operations. You don't call individual endpoints — you ask the agent in plain English via one endpoint: `POST http://localhost:8000/api/v1/agent/query`.
+BrainDB has its own internal agent (LiteLLM with pluggable provider via `LLM_PROFILE`; defaults to `deepinfra/google/gemma-4-31B-it`) that handles all memory operations. You don't call individual endpoints — you ask the agent in plain English via one endpoint: `POST http://localhost:8000/api/v1/agent/query`.
 
 ### Health check:
 !`curl -sf http://localhost:8000/health > /dev/null 2>&1 && echo "OK" || echo "BRAINDB_DOWN"`
@@ -28,12 +28,23 @@ BrainDB has its own internal agent (LiteLLM + NVIDIA NIM) that handles all memor
 
 ## TOOL PRIORITY
 
-The agent already uses the sophisticated retrieval (keyword-embedding + graph
-+ ranking) and can delegate to subagents. Phrase requests as goals ("find /
-recall / understand …", "delegate a deep investigation of …"). **Do not tell
-it to "run SQL"** for recall or understanding — raw SQL discards the graph and
-embeddings. SQL is only ever for an explicit aggregate ("how many facts per
-source?"), which you can simply ask for in plain English anyway.
+The agent already uses the sophisticated retrieval (keyword-mediated fuzzy +
+embedding + graph + ranking, with a two-level diversity quota) and can
+delegate to subagents. Phrase requests as goals ("find / recall / understand
+…", "delegate a deep investigation of …"). **Do not tell it to "run SQL"**
+for recall or understanding — raw SQL discards the graph and embeddings. If
+you're tempted to phrase a request as *"run a SQL query that finds…"* for
+*finding* or *understanding* something, stop — that's the sophisticated
+recall path's job. Ask in plain English. SQL is only ever for an explicit
+aggregate ("how many facts per source?"), which you can simply ask for in
+plain English anyway.
+
+**Wikis** are first-class memory entities curated by an internal maintainer +
+writer pipeline. The agent surfaces them through recall automatically when
+relevant — you don't have to ask for them explicitly, and you don't have to
+trigger anything to make new ones. Saving facts with the right keywords is
+enough; the scheduler runs maintain → write on its 60s tick and the wikis
+materialise on their own.
 
 Internally the agent now researches from **short previews** and reads a full
 body only by id (paging large ones, or delegating big documents to a
@@ -73,21 +84,66 @@ curl -s -X POST http://localhost:8000/api/v1/agent/query \
   -d '{"query":"Save: the user just told me they prefer simple code over abstractions. Source: user-stated. Connect to existing preference entities."}'
 ```
 
-**Be proactive**: save user profile info, expertise, preferences, decisions, inferences you make about their working style. When in doubt, save it.
+### Proactive save — but ASK the user first
+
+The pattern is **RECALL → ASK → SAVE**:
+
+1. When the user shares something that *might* be worth remembering (a name,
+   role, project, preference, decision, your own inference about them), RECALL
+   first via the agent to check if it's already known.
+2. If it's **net-new**, **ASK the user**:
+
+   > "I haven't seen this before — should I save it to BrainDB? I'd file it
+   > as a [fact / thought / rule] tagged with [keywords]."
+
+3. Only on a 'yes', issue the save request to the agent.
+
+Don't pre-save without confirmation. The user has the final say on what
+becomes long-term memory. User-confirmed memory is higher-signal and lets
+the user catch judgement-call mistakes early.
+
+**Exception**: when the user explicitly framed it as a rule ("from now on,
+always X"; "never do Y"), save it without an extra confirmation — they
+already said it — but surface the action: "Saving that as a rule."
+
+#### What's worth flagging to the user
+
+- Identity / role / company (one-time setup info)
+- Strong preferences or working-style rules
+- Project / topic context the user just disclosed
+- Decisions the user explicitly made
+- Useful URLs or references the user shared
+- Your own inferences about the user (tag as `thought`,
+  `source=agent-inference`) — ASK before persisting these too; an inference
+  is still memory.
+
+The goal is to capture **what the user gives you in conversation that isn't
+already in BrainDB** — not to scrape every utterance. Information already in
+recall doesn't need saving again; ephemeral task details
+("currently debugging X") don't need saving at all.
 
 ---
 
 ## Example queries
 
+### Recall (no confirmation needed — these are reads)
+
 | Situation | Query to send to the agent |
 |-----------|---------------------------|
 | Start of conversation | `"Tell me who the user is - role, expertise, preferences, recent projects."` |
 | User mentions a topic | `"What do you know about the user ML experience and AI projects?"` |
-| User shares a fact | `"Save: user is working on the IR pipeline multilingual extraction. Connect to existing IR entities."` |
-| User gives a preference | `"Save as rule: always prefer simple code over abstractions. Source: user-stated. Category: behavior."` |
 | User asks about past work | `"What has the user shipped recently? Check facts with source=user-stated from the last month."` |
 | Need to find duplicates | `"Find near-duplicate entities in memory."` |
 | Explore the graph | `"What are the densest topics in memory? Which entities have the most connections?"` |
+
+### Save (RECALL → ASK → SAVE — only send the agent query after the user confirms)
+
+| Situation | What Claude says to the user first | What Claude sends to the agent (on a 'yes') |
+|---|---|---|
+| User mentions something net-new | "I noticed you just said you're working on the IR pipeline multilingual extraction — that looks worth saving. Should I?" | `"Save: user is working on the IR pipeline multilingual extraction. Connect to existing IR entities."` |
+| User shares a preference | "Should I save that as a long-term preference?" | `"Save as fact: user prefers simple code over abstractions. Source: user-stated. Keywords: user-preference, code-style."` |
+| User explicitly states a rule | (no confirmation — they framed it as a rule) "Saving that as a rule." | `"Save as rule: always prefer simple code over abstractions. Source: user-stated. Category: behavior."` |
+| You drew an inference about the user | "I'm getting the sense you're senior in ML — should I save that as a thought?" | `"Save as thought: user appears senior in ML based on the depth of their question. Source: agent-inference. Certainty: 0.6."` |
 
 ---
 
