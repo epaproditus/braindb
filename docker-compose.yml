@@ -60,6 +60,7 @@ services:
       - local-network
     environment:
       BRAINDB_API_URL: http://api:${API_PORT:-8000}
+      WIKI_ENABLED: ${WIKI_ENABLED:-false}
       WIKI_INTERVAL: ${WIKI_INTERVAL:-60}
     volumes:
       - .:/app

@@ -28,6 +28,12 @@ DRAIN_MAX = int(os.getenv("WIKI_DRAIN_MAX", "20"))        # safety bound on /wri
 # FOR UPDATE SKIP LOCKED on every claim and try_wiki_lock per wiki).
 # `maintain` runs concurrently alongside writers (1 maintain in flight, C1).
 WRITE_PARALLELISM = int(os.getenv("WIKI_WRITE_PARALLELISM", "3"))
+
+# Master on/off for the whole wiki pipeline. Default OFF so bringing the
+# stack up never auto-starts token-heavy work. Opt in explicitly with
+# WIKI_ENABLED=true (or 1/yes/on). Model-agnostic; orthogonal to any LLM
+# profile/provider.
+WIKI_ENABLED = os.getenv("WIKI_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 AGENT_TIMEOUT = int(os.getenv("WIKI_AGENT_TIMEOUT", "600"))
 
 logging.basicConfig(
@@ -87,6 +93,13 @@ def _pending_kinds() -> tuple[bool, bool]:
 
 
 def main() -> None:
+    if not WIKI_ENABLED:
+        log.info("wiki pipeline DISABLED (set WIKI_ENABLED=true to enable). Idle.")
+        # Sleep forever — keeps the container Up without restart-loop, and
+        # makes zero LLM/DB/api calls. Toggle via env + scheduler restart.
+        while True:
+            time.sleep(3600)
+
     log.info("waiting for API at %s ...", API_URL)
     if not wait_for_api():
         log.error("API never came up; exiting")
