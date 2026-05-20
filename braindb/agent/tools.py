@@ -35,6 +35,7 @@ from braindb.services.keyword_service import (
     sync_keywords_for_entity,
 )
 from braindb.services.search import fuzzy_search, preview, slice_content
+from braindb.agent.run_state import record_submit
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerDecision,
@@ -813,21 +814,21 @@ async def delegate_to_subagent(task: str) -> str:
     _call_depth += 1
     try:
         # Local imports to avoid circular dependency on agent.py
-        from agents import Runner
-        from braindb.agent.agent import get_subagent
+        from braindb.agent.agent import get_subagent, run_typed
         from braindb.config import settings
 
         logger.info("Subagent starting: %s", task[:200])
-        subagent = get_subagent()
-        result = await Runner.run(
-            starting_agent=subagent,
-            input=task,
+        # run_typed isolates the subagent's submit slot from ours (its own
+        # `last_submit.set(None)` token + reset in `finally`), so we cannot
+        # leak the subagent's SubagentResult into the parent's run_typed.
+        payload: SubagentResult = await run_typed(
+            task,
+            get_subagent(),
+            SubagentResult,
             max_turns=settings.agent_subagent_max_turns,
         )
-        fo = result.final_output
-        text = fo.result if isinstance(fo, SubagentResult) else str(fo)
         logger.info("Subagent completed.")
-        return _truncate(text)
+        return _truncate(payload.result)
     except Exception as e:
         logger.exception("Subagent failed")
         return _err(f"subagent failed: {e}")
@@ -841,37 +842,50 @@ async def delegate_to_subagent(task: str) -> str:
 
 # Convention (absolute): the run finishes ONLY by calling `submit_result`,
 # and its argument is ALWAYS a typed Pydantic model — never a loose string.
-# `@function_tool` turns the model into a strict JSON schema for the tool
-# arguments, so the LLM is constrained to emit valid structured output (it
-# cannot free-run and truncate). There is one typed variant per agent purpose;
-# every variant keeps the name "submit_result" so prompts and
-# `StopAtTools(["submit_result"])` stay generic. Each returns the validated
-# model unchanged; the agent's `output_type` makes the SDK keep it as the
-# typed final output (no str() coercion).
+# `@function_tool` validates the LLM's call args against the model BEFORE
+# invoking the body, so `payload` is guaranteed-valid inside each function.
+# There is one typed variant per agent purpose; every variant keeps the
+# name "submit_result" so prompts and `StopAtTools(["submit_result"])`
+# stay generic.
+#
+# Each variant parks the validated payload into the per-Task ContextVar
+# (see braindb/agent/run_state.py) so `run_typed` can hand it back
+# typed. The returned "ok" string is irrelevant — we never read
+# `result.final_output`; `StopAtTools` only needs the loop to stop.
+#
+# Why a ContextVar instead of `output_type=<Model>` on the Agent:
+# `output_type` makes the SDK pass `response_format: json_schema` on
+# EVERY LLM turn (not just the final one), which steers weaker models to
+# satisfy the schema on turn 1 and never call tools. The side-channel
+# capture keeps middle turns free while still delivering a typed final.
 
 @function_tool(name_override="submit_result")
 @_verbose("submit_result")
-async def submit_answer(payload: AgentAnswer) -> AgentAnswer:
+async def submit_answer(payload: AgentAnswer) -> str:
     """Submit the final answer. Call this exactly once when you're done."""
-    return payload
+    record_submit(payload)
+    return "ok"
 
 
 @function_tool(name_override="submit_result")
 @_verbose("submit_result")
-async def submit_maintainer(payload: MaintainerDecision) -> MaintainerDecision:
+async def submit_maintainer(payload: MaintainerDecision) -> str:
     """Submit the maintainer decision. Call this exactly once when you're done."""
-    return payload
+    record_submit(payload)
+    return "ok"
 
 
 @function_tool(name_override="submit_result")
 @_verbose("submit_result")
-async def submit_wiki(payload: WikiWriteResult) -> WikiWriteResult:
+async def submit_wiki(payload: WikiWriteResult) -> str:
     """Submit the finished wiki. Call this exactly once when you're done."""
-    return payload
+    record_submit(payload)
+    return "ok"
 
 
 @function_tool(name_override="submit_result")
 @_verbose("submit_result")
-async def submit_subagent(payload: SubagentResult) -> SubagentResult:
+async def submit_subagent(payload: SubagentResult) -> str:
     """Submit the delegated task result. Call this exactly once when you're done."""
-    return payload
+    record_submit(payload)
+    return "ok"

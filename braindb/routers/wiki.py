@@ -87,18 +87,18 @@ async def wiki_maintain():
         content=(orphan.get("content") or "")[:4000],
         wiki_catalog=catalog_txt,
     )
+    # `run_typed` returns a SDK-validated MaintainerDecision, or raises if
+    # the model never submitted (e.g. max_turns hit) — that error path
+    # below treats it like any other agent failure (release + log + 5xx).
     try:
-        res = await run_typed(prompt, get_maintainer_agent(), max_turns=30)
+        res: MaintainerDecision = await run_typed(
+            prompt, get_maintainer_agent(), MaintainerDecision, max_turns=30
+        )
     except Exception as e:
         logger.exception("maintainer agent failed")
         with get_conn() as conn:
             wiki_jobs.finish_job(conn, job_id, "failed", f"agent error: {e}"[:500])
         return {"claimed": 1, "job_id": job_id, "result": "failed", "reason": str(e)}
-
-    if not isinstance(res, MaintainerDecision):
-        with get_conn() as conn:
-            wiki_jobs.finish_job(conn, job_id, "failed", f"untyped output: {str(res)[:400]}")
-        return {"claimed": 1, "job_id": job_id, "result": "failed", "reason": "untyped agent output"}
 
     # Schema-validated; expose as a dict so the action handlers below are
     # unchanged.
@@ -274,20 +274,24 @@ async def wiki_write():
     )
     # Generous turns so the writer can recall_memory / view_tree / delegate a
     # subagent to research and verify before writing.
+    # `run_typed` returns a SDK-validated WikiWriteResult, or raises if the
+    # model never submitted — handled below like any agent failure
+    # (release + log + 5xx). The only extra guard is "non-empty body";
+    # everything else is the model's job (and validated by Pydantic).
     try:
-        res = await run_typed(prompt, get_writer_agent(), max_turns=30)
+        res: WikiWriteResult = await run_typed(
+            prompt, get_writer_agent(), WikiWriteResult, max_turns=30
+        )
     except Exception as e:
         logger.exception("writer agent failed")
         with get_conn() as conn:
             disp = wiki_jobs.release_or_fail_jobs(conn, job_ids, f"agent error: {e}")
         return {"written": 0, "result": disp, "reason": str(e)}
 
-    # Schema-validated typed output. `body` is the complete markdown page;
-    # consolidate also carries `canonical_id` (the survivor it chose).
-    if not isinstance(res, WikiWriteResult) or not (res.body or "").strip():
+    if not (res.body or "").strip():
         with get_conn() as conn:
             disp = wiki_jobs.release_or_fail_jobs(
-                conn, job_ids, f"no/invalid typed body: {str(res)[:300]}")
+                conn, job_ids, f"empty body returned: {res.model_dump_json()[:300]}")
         return {"written": 0, "result": disp, "reason": "no body returned"}
     new_body = res.body
 
