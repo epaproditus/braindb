@@ -138,6 +138,38 @@ def find_similar_keywords(conn, query_embedding: list[float], limit: int = 20) -
         return [dict(r) for r in cur.fetchall()]
 
 
+def find_fuzzy_keywords(conn, query: str, limit: int = 20) -> list[dict]:
+    """Trigram-similarity search against keyword entities.
+
+    Mirror image of `find_similar_keywords` (the embedding-based form):
+    the query is matched against the *keyword text itself* (not against
+    long entity bodies), so a short query vs a short keyword gives a fair
+    trigram intersection — no dilution. Returns rows in the same shape
+    as `find_similar_keywords` so `assemble_context` can use the two
+    pathways symmetrically (match query → keyword → fan out via
+    `find_entities_for_keywords`).
+
+    This is the indexing-layer view of fuzzy: the user-stated design
+    intent of BrainDB is that keywords are the hub. Direct
+    entity-content fuzzy still exists in `services.search.fuzzy_search`
+    for `quick_search` / `/memory/search` (arbitrary-content matching).
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, content AS keyword,
+                   similarity(content, %s) AS similarity
+            FROM entities
+            WHERE entity_type = 'keyword'
+              AND similarity(content, %s) > 0.1
+            ORDER BY similarity(content, %s) DESC
+            LIMIT %s
+            """,
+            (query, query, query, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 def find_entities_for_keywords(conn, keyword_entity_ids: list[str]) -> list[dict]:
     """
     Find all non-keyword entities tagged with the given keyword entities.

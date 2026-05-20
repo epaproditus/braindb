@@ -61,6 +61,34 @@ class Settings(BaseSettings):
     scoring_pool_keyword_neighbors: int = 500   # top-K keyword embeddings to consider
     scoring_pool_fuzzy: int = 500               # top-K fuzzy/full-text candidates to consider
 
+    # Two-level diversity quota on recall output.
+    #
+    # Level 1 — per-search-term: each query string in `queries[]` gets
+    # `per_query_share / num_queries` of `max_results` reserved for its
+    # OWN top-ranked entities. Forces multi-angle representation: if
+    # the agent issues [narrow_keyword, broader_phrase, third_angle],
+    # all three angles surface in the result, regardless of which one
+    # has the highest absolute scores. Set per_query_share=0 to disable.
+    #
+    # Level 2 — per-keyword (dominant matched keyword): walks the
+    # remaining (open) slots in `final_rank` order and gives each new
+    # dominant keyword a halving slot allowance (50% / 25% / 12.5% ...
+    # of max_results, floor 1). Stops one popular keyword (e.g.
+    # `user-profile`) from monopolising the open portion.
+    #
+    # The two levels share ONE counter dict — L1 reservations decrement
+    # the same per-keyword allowance L2 walks against. So a popular
+    # keyword cannot double-spend across the two layers.
+    per_query_share: float = 0.5
+    keyword_quota_halving: float = 0.5
+
+    # How many entities the LLM-facing recall (`recall_memory` tool /
+    # `/memory/context` API) returns by default. Wider default = the LLM
+    # sees more candidates per call (more diverse, more discoverable),
+    # at the cost of more prompt tokens. Tune in code, not via .env, so
+    # all deployments share one measure.
+    recall_default_max_results: int = 30
+
     # Always-on rules cap
     max_always_on_rules: int = 10
 

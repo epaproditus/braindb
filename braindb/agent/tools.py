@@ -107,15 +107,42 @@ def _verbose(name: str):
 
 @function_tool
 @_verbose("recall_memory")
-async def recall_memory(queries: list[str], max_results: int = 15) -> str:
+async def recall_memory(
+    queries: list[str],
+    max_results: int = settings.recall_default_max_results,
+) -> str:
     """Search BrainDB memory with multiple natural language queries.
     Runs fuzzy + fulltext + keyword embedding search, merges with geometric mean,
     traverses the graph up to 3 hops, applies temporal decay.
     Use this as the primary recall tool.
 
+    QUERY STRATEGY — IMPORTANT for high-recall on narrow subjects:
+
+    BrainDB indexes via short keyword entities. A 1-word query like
+    "Petros" matches the keyword "Petros" cleanly (similarity ~1.0). A
+    long phrase like "Petros person identity profile" matches the same
+    keyword at much lower similarity (~0.4) because pg_trgm dilutes
+    when comparing short keywords to long query strings.
+
+    Therefore: prefer MULTIPLE narrow queries over one long phrase. The
+    sweet spot for a focused subject is:
+      - one or two SINGLE-KEYWORD queries (the names you care about),
+      - plus 1-2 broader semantic phrases for adjacent context.
+
+    Examples:
+      GOOD:  ["Petros", "Selonda Saronikos fish farm", "Dimitrios manager"]
+      BAD:   ["Petros person identity profile relation to Dimitris"]
+
+    Each query you provide gets a reserved share of the top results
+    (per-search-term quota), so adding the bare keyword as one of your
+    queries GUARANTEES that subject surfaces — it doesn't compete with
+    the broader phrases.
+
     Args:
-        queries: List of search queries (use multiple angles for better coverage).
-        max_results: Max items to return (1-100, default 15).
+        queries: List of search queries. Prefer 2-4 short focused queries
+            over one long phrase. Include the bare keyword(s) of the
+            subject you're investigating as standalone queries.
+        max_results: Max items to return (1-100, default 30).
     """
     try:
         req = ContextRequest(queries=queries, max_results=max_results)
