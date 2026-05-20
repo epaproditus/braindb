@@ -105,6 +105,44 @@ def test_prompts_no_stale_submit_result(prompt_path: Path) -> None:
     )
 
 
+def test_writer_prompt_has_attach_mode_efficiency_hint() -> None:
+    """Regression cover for the attach-mode recall-budget guidance added
+    to wiki_writer_prompt.md (a future accidental delete should trip red
+    immediately, before live behaviour regresses). Asserts:
+    - the new 'Attach mode — read the existing body before recalling' block
+      is present,
+    - the three recall-budget bullets are present,
+    - the existing 'conservatively' caution rephrasing of the prior
+      'NOT evidence' rule is present (the prior strict rule has been
+      replaced; this protects the new wording from a silent revert)."""
+    repo_root = Path(__file__).parent.parent
+    body = (repo_root / "braindb/agent/prompts/wiki_writer_prompt.md").read_text(encoding="utf-8")
+
+    # The Attach-mode header
+    assert "Attach mode — read the existing body before recalling" in body, (
+        "Draft B header missing from writer prompt — recall-budget guidance was lost"
+    )
+
+    # Each of the three recall-budget bullet keys
+    for bullet in [
+        "new members (the `MEMBERS` block)",
+        "claims that look inconsistent between the body and a new member",
+        "gaps the new members open up",
+    ]:
+        assert bullet in body, f"Draft B bullet missing from writer prompt: {bullet!r}"
+
+    # The softened "conservatively" rephrasing of the prior "NOT evidence" rule
+    assert "conservatively" in body, (
+        "Softened 'conservatively' caution missing — the prior 'NOT evidence' rule "
+        "may have been re-introduced verbatim or the new wording dropped"
+    )
+
+    # Closing balance phrase
+    assert "Be thorough where evidence is fresh or conflicting" in body, (
+        "Draft B closing balance phrase missing"
+    )
+
+
 # ------------------------------------------------------------------ #
 # Slot pattern (already shipped in 8560cfa; regression coverage)      #
 # ------------------------------------------------------------------ #

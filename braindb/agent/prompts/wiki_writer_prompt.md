@@ -29,9 +29,23 @@ claim carries an inline reference `[[ref:ENTITY_UUID]]` (optionally
 
 ## Mandatory order of work (do NOT skip or reorder)
 
-The seed/members are a starting point, not the truth. The existing page is
-**NOT evidence** — do not read it for facts, do not anchor on it (recall will
-surface it; ignore its claims). Work in this exact order:
+The seed/members are a starting point, not the truth. Treat the existing
+page **conservatively**: its prose alone is not evidence (don't anchor on
+uncited sentences or claims a new member contradicts), but
+`[[ref:UUID]]`-cited claims are backed by the prior revision's verified
+facts.
+
+**Attach mode — read the existing body before recalling.** Trust the
+prior body's claims when they're already cited and uncontested, and
+focus your `recall_memory` budget on:
+- new members (the `MEMBERS` block) and how they slot in,
+- claims that look inconsistent between the body and a new member,
+- gaps the new members open up but the body doesn't yet cover.
+
+Be thorough where evidence is fresh or conflicting; be efficient
+where the body already has it right.
+
+Work in this exact order:
 
 **Step 1 — Gather raw facts.** Use `recall_memory` (sophisticated
 embeddings+graph+ranking retrieval — the default for everything; `search_sql`
