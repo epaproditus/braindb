@@ -25,6 +25,11 @@ _LLM_PROFILES: dict[str, dict[str, str]] = {
         "api_key_env": "VLLM_API_KEY",
         "base_url": "http://host.docker.internal:8010/v1",
     },
+    "vllm_workstation_gemma": {
+        "model": "openai/cyankiwi/gemma-4-31B-it-AWQ-4bit",
+        "api_key_env": "VLLM_API_KEY",
+        "base_url": "http://host.docker.internal:8009/v1",
+    },
 }
 
 
