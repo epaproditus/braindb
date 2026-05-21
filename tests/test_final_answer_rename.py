@@ -399,8 +399,12 @@ async def test_run_typed_correction_message_appended_on_retry() -> None:
         # the helper must pick one of its allowed values (not "<action>"),
         # otherwise the example would fail Pydantic validation.
         (MaintainerDecision, ["action", "rationale"], "attach"),
-        # WikiWriteResult: mode + body. mode is a Literal too.
-        (WikiWriteResult, ["mode", "body"], "create"),
+        # WikiWriteResult: only `mode` is required after the section-edit
+        # work (body became optional default-"" to support the
+        # section-edit persistence path; see
+        # feat/wikis-and-maintainer-agent-read-write-tools). mode is a
+        # Literal — the helper must pick one of its allowed values.
+        (WikiWriteResult, ["mode"], "create"),
         # SubagentResult: just `result`.
         (SubagentResult, ["result"], None),
     ],
@@ -438,7 +442,9 @@ def test_expected_shape_hint_covers_required_keys(model, required_keys, must_con
     [
         (submit_answer, AgentAnswer, ["answer"]),
         (submit_maintainer, MaintainerDecision, ["action", "rationale"]),
-        (submit_wiki, WikiWriteResult, ["mode", "body"]),
+        # body became optional with the section-edit work; only mode is
+        # still required at the Pydantic level.
+        (submit_wiki, WikiWriteResult, ["mode"]),
         (submit_subagent, SubagentResult, ["result"]),
     ],
     ids=["answer", "maintainer", "wiki", "subagent"],

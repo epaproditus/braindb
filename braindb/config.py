@@ -137,6 +137,23 @@ class Settings(BaseSettings):
     agent_retry_on_missing_final: bool = True
     agent_retry_max_turns: int = 3
 
+    # Writer-only context-handoff threshold. When the cheap token estimate
+    # of the writer's running conversation crosses this absolute number,
+    # `CountdownHooks` injects ONE synthetic user message asking the model
+    # to call `handoff_to_successor` with a structured brief (progress +
+    # remaining work). The writer's run wrapper in `routers/wiki.py` then
+    # spawns a successor agent (same prompt + tools, fresh context) seeded
+    # with that brief. Bounded by `agent_writer_handoff_max_depth` so a
+    # misbehaving model cannot thrash forever.
+    #
+    # Why a single absolute-token knob rather than a per-profile pct:
+    # Gemma local has `max_model_len=13000` (so 9000 ≈ 70%); Qwen and
+    # deepinfra have ~32K (so 9000 fires earlier than strictly needed,
+    # but never too late — safe). Avoids per-profile bookkeeping. Set to
+    # 0 to disable the handoff nudge entirely.
+    agent_writer_handoff_token_budget: int = 9000
+    agent_writer_handoff_max_depth: int = 3
+
     @property
     def resolved_agent_model(self) -> str:
         return self.agent_model or _LLM_PROFILES[self.llm_profile]["model"]

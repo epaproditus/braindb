@@ -199,6 +199,40 @@ just rewrite the whole body for a small wiki, that path is unchanged
 same run: either use section tools and submit `body=""`, OR rewrite
 fully via `body`.
 
+## Context handoff — when you're running out of room
+
+If the system injects a "your context is filling up" nudge naming the
+`handoff_to_successor` tool, the conversation has grown close to the
+model's window. You have two choices:
+
+- If your remaining work fits in **1-2 more turns**, finish cleanly:
+  call `final_answer` directly (with `body=""` if you used section
+  edits, or the full body otherwise).
+- Otherwise, call `handoff_to_successor(progress_summary, remaining_work)`.
+  A fresh agent with the SAME prompt and tools will continue from your
+  brief. After your handoff call your run ends — the successor takes
+  over with a clean context.
+
+The handoff brief must be precise. The successor only sees what you
+write:
+
+- `progress_summary`: a tight list of (a) the tools you've called so
+  far and what came back of value, (b) any active revision tokens
+  (e.g., "edited Dimitrios.timeline at revision 14 → 15"), (c) facts
+  / resolutions / identity decisions you committed to. Keep it
+  factual; no narrative.
+- `remaining_work`: the concrete next tool call(s) the successor must
+  make. Name wikis, section names, and current revisions explicitly.
+  Example: "Read `read_wiki_section(wiki_id='25ab...', section_name='references')`
+  with `expect_revision=15`, then `edit_wiki_section` to add bullets
+  for fact-ids [a, b, c]. Then `validate_wiki` and call `final_answer`
+  with `body=""`."
+
+If your successor ALSO approaches the limit, it can call
+`handoff_to_successor` again — the chain continues up to a hard depth
+cap. Don't ration handoffs out of politeness; use them whenever the
+brief is cheaper than holding the work.
+
 ## Output — STRICT
 
 Finish by calling `final_answer` exactly once. Its argument is a typed

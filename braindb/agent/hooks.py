@@ -41,27 +41,95 @@ from agents.lifecycle import RunHooks
 logger = logging.getLogger(__name__)
 
 
+def _estimate_tokens(input_items: list) -> int:
+    """Cheap (no-tokenizer) prompt-token estimate: sum the text-content
+    character counts and divide by 4. Defensive across the shapes the
+    SDK puts into `input_items`:
+    - `{"role": str, "content": str}` (LiteLLM dict form)
+    - `{"role": str, "content": [{"type":"text","text":str}, ...]}`
+      (some providers send a list of parts)
+    - SDK item objects with a `.content` attribute
+    Unknown shapes contribute 0; the estimate is a lower bound, which
+    is the safe side for "is context filling up" decisions (we'd rather
+    fire the handoff nudge slightly late than slightly never)."""
+    total_chars = 0
+    for item in input_items:
+        content: object
+        if isinstance(item, dict):
+            content = item.get("content", "")
+        else:
+            content = getattr(item, "content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text") or part.get("content") or ""
+                    if isinstance(text, str):
+                        total_chars += len(text)
+                elif isinstance(part, str):
+                    total_chars += len(part)
+    return total_chars // 4
+
+
 class CountdownHooks(RunHooks):
-    """Mutates `input_items` to inject a "you have N turns left, finalise"
-    user message when the agent is close to exhausting `max_turns`.
+    """Mutates `input_items` to inject up to TWO independent nudges:
+
+    1. Turn-budget nudge ("you have N turns left, finalise") — fires when
+       the agent is close to exhausting `max_turns`. Original behaviour;
+       see module docstring.
+
+    2. Token-budget nudge ("context is filling up, call handoff_to_successor")
+       — fires ONLY when `token_budget > 0` AND the cheap token estimate
+       of `input_items` (sum-of-content-chars / 4) exceeds the budget.
+       Writer-only: callers that don't set `token_budget` get the
+       original turn-only behaviour. The two nudges have independent
+       fired-once flags so one cannot suppress the other.
 
     Lifecycle (per run):
-      - constructed once with `max_turns`, `threshold`, `tool_name`.
-      - `on_llm_start` fires before each LLM call; increments `_turns`.
-      - when `_turns >= max_turns - threshold` AND `_fired` is False,
-        flips `_fired = True` and appends ONE message to `input_items`.
-      - subsequent calls are no-ops because `_fired` is True.
+      - constructed once with knobs (turn-related + optional token-related).
+      - `on_llm_start` fires before each LLM call.
+        - increments `_turns`; if `_turns >= max_turns - threshold` AND
+          `_fired_turns` is False, appends the turn nudge.
+        - if `token_budget > 0` AND
+          `estimated_tokens(input_items) > token_budget` AND
+          `_fired_tokens` is False, appends the handoff nudge.
+      - each nudge fires at most once per run.
 
-    Disabled when `threshold <= 0` (the hook still receives callbacks but
-    never injects).
+    Disabled paths:
+      - `threshold <= 0` disables the turn nudge (existing safety hatch).
+      - `token_budget <= 0` disables the handoff nudge (default; non-writer
+        callers don't pass this).
     """
 
-    def __init__(self, max_turns: int, threshold: int, tool_name: str = "final_answer") -> None:
+    def __init__(
+        self,
+        max_turns: int,
+        threshold: int,
+        tool_name: str = "final_answer",
+        *,
+        token_budget: int = 0,
+        handoff_tool_name: str = "handoff_to_successor",
+    ) -> None:
         self.max_turns = max_turns
         self.threshold = max(0, int(threshold))
         self.tool_name = tool_name
+        self.token_budget = max(0, int(token_budget))
+        self.handoff_tool_name = handoff_tool_name
         self._turns: int = 0
-        self._fired: bool = False
+        self._fired_turns: bool = False
+        self._fired_tokens: bool = False
+
+    # Backwards-compatibility: existing tests reference `._fired` on
+    # instances built without token_budget. Map it to the turn-fired
+    # flag so they keep observing the same semantic.
+    @property
+    def _fired(self) -> bool:  # noqa: D401
+        return self._fired_turns
+
+    @_fired.setter
+    def _fired(self, v: bool) -> None:
+        self._fired_turns = v
 
     # NOTE: `on_llm_start` is the canonical hook for injecting context
     # before the next LLM call (the SDK passes `input_items` mutably).
@@ -84,27 +152,53 @@ class CountdownHooks(RunHooks):
             )
 
     def _maybe_inject(self, input_items: list) -> None:
-        """Pure logic: decide whether to append the nudge now. Separated so
-        tests can stub it to verify the on_llm_start wrapper's
-        exception-swallowing behaviour."""
-        if self.threshold <= 0:
-            return  # explicitly disabled
-        if self._fired:
-            return  # already nudged once; no spam
-        remaining = self.max_turns - self._turns
-        if remaining > self.threshold:
-            return  # still plenty of room
-        # Time to nudge. Append one synthetic user message; subsequent
-        # turns will not re-inject (_fired flips).
-        self._fired = True
-        nudge = self._format_nudge(remaining)
-        # The SDK accepts either {"role":..., "content":...} dicts or
-        # ResponseInputItem instances in `input_items`. Dict form is
-        # provider-portable across the LiteLLM backends we use.
-        input_items.append({"role": "user", "content": nudge})
-        logger.info(
-            "CountdownHooks injected nudge at turn %d/%d (remaining=%d): %s",
-            self._turns, self.max_turns, remaining, nudge[:120],
+        """Pure logic: decide whether to append a nudge now. Two
+        independent checks (turn-budget + token-budget); each fires at
+        most once per run. Separated from on_llm_start so tests can stub
+        it to verify the wrapper's exception-swallowing behaviour."""
+        # Turn-budget nudge (original Layer 3).
+        if self.threshold > 0 and not self._fired_turns:
+            remaining = self.max_turns - self._turns
+            if remaining <= self.threshold:
+                self._fired_turns = True
+                nudge = self._format_nudge(remaining)
+                input_items.append({"role": "user", "content": nudge})
+                logger.info(
+                    "CountdownHooks injected TURN nudge at turn %d/%d "
+                    "(remaining=%d): %s",
+                    self._turns, self.max_turns, remaining, nudge[:120],
+                )
+
+        # Token-budget nudge (handoff path).
+        if self.token_budget > 0 and not self._fired_tokens:
+            est = _estimate_tokens(input_items)
+            if est > self.token_budget:
+                self._fired_tokens = True
+                handoff = self._format_handoff_nudge(est)
+                input_items.append({"role": "user", "content": handoff})
+                logger.info(
+                    "CountdownHooks injected HANDOFF nudge (est_tokens=%d, "
+                    "budget=%d): %s",
+                    est, self.token_budget, handoff[:120],
+                )
+
+    def _format_handoff_nudge(self, est_tokens: int) -> str:
+        """Text the model sees when token usage crosses the budget. Asks
+        it to call the handoff tool with a structured brief; gives the
+        agent an escape hatch (call final_answer directly) for small
+        remaining work."""
+        return (
+            f"Your context is filling up (≈{est_tokens} estimated tokens; "
+            f"budget {self.token_budget}). To avoid running out, call "
+            f"`{self.handoff_tool_name}` now with a structured brief:\n"
+            f"- progress_summary: tools you've called, key findings, and "
+            f"any active revision tokens (the wiki you've been editing).\n"
+            f"- remaining_work: the concrete next tool call(s) the "
+            f"successor must make — name wikis, section names, revisions.\n"
+            f"A fresh agent with the same prompt and tools will continue "
+            f"from your brief. If you can still finish in 1-2 turns you "
+            f"may instead call `{self.tool_name}` directly, but err on "
+            f"the side of handoff when context is this tight."
         )
 
     def _format_nudge(self, remaining: int) -> str:

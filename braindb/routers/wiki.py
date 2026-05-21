@@ -12,7 +12,9 @@ from pathlib import Path
 from fastapi import APIRouter, Query
 
 from braindb.agent.agent import run_typed, get_maintainer_agent, get_writer_agent
+from braindb.agent.run_state import install_handoff_slot, release_handoff_slot
 from braindb.agent.schemas import MaintainerDecision, WikiWriteResult
+from braindb.config import settings
 from braindb.db import get_conn
 from braindb.services.activity_log import log_activity
 from braindb.services import wiki_jobs
@@ -297,15 +299,75 @@ async def wiki_write():
     # (release + log + 5xx). The only extra guard is "non-empty body OR
     # section edits happened"; everything else is the model's job (and
     # validated by Pydantic).
+    #
+    # Context-handoff loop: the writer may end early via
+    # `handoff_to_successor` when its context approaches the limit (see
+    # `braindb/agent/hooks.py` token-budget watch + `tools.py` handoff
+    # tool). We install a per-run handoff slot, run the agent, and if
+    # the slot was filled we spawn a successor agent — same prompt, same
+    # tools, fresh context — seeded with the previous agent's brief.
+    # Bounded by `agent_writer_handoff_max_depth` so a misbehaving model
+    # cannot recurse forever.
+    handoff_slot, handoff_token = install_handoff_slot()
     try:
-        res: WikiWriteResult = await run_typed(
-            prompt, get_writer_agent(), WikiWriteResult, max_turns=30
-        )
-    except Exception as e:
-        logger.exception("writer agent failed")
-        with get_conn() as conn:
-            disp = wiki_jobs.release_or_fail_jobs(conn, job_ids, f"agent error: {e}")
-        return {"written": 0, "result": disp, "reason": str(e)}
+        try:
+            res: WikiWriteResult = await run_typed(
+                prompt, get_writer_agent(), WikiWriteResult, max_turns=30,
+                token_budget=settings.agent_writer_handoff_token_budget,
+            )
+            depth = 0
+            max_depth = settings.agent_writer_handoff_max_depth
+            while handoff_slot.captured and depth < max_depth:
+                depth += 1
+                seed = (
+                    "Continuing from a previous agent run that ended early "
+                    "via `handoff_to_successor` because its context was "
+                    "filling up. You have the SAME prompt, the SAME tools, "
+                    "and a fresh context window. Resume from this state.\n\n"
+                    "PROGRESS SO FAR (from the previous agent):\n"
+                    f"{handoff_slot.progress_summary}\n\n"
+                    "REMAINING WORK:\n"
+                    f"{handoff_slot.remaining_work}\n\n"
+                    "Pick up from here. Call `final_answer` when done "
+                    "(body=\"\" if you persisted via section-edit tools, "
+                    "or the full body otherwise). If YOUR context also "
+                    "fills up before you finish, call `handoff_to_successor` "
+                    "again with an updated brief — the same successor "
+                    "mechanism will continue."
+                )
+                handoff_slot.captured = False
+                handoff_slot.progress_summary = ""
+                handoff_slot.remaining_work = ""
+                logger.info(
+                    "writer handoff: spawning successor #%d/%d (mode=%s, jobs=%s)",
+                    depth, max_depth, mode, job_ids,
+                )
+                res = await run_typed(
+                    seed, get_writer_agent(), WikiWriteResult, max_turns=30,
+                    token_budget=settings.agent_writer_handoff_token_budget,
+                )
+            if handoff_slot.captured:
+                # Depth cap hit AND last run still asked for handoff —
+                # treat as a failure (the model isn't converging).
+                logger.warning(
+                    "writer handoff: depth cap %d hit; treating as failure",
+                    max_depth,
+                )
+                with get_conn() as conn:
+                    disp = wiki_jobs.release_or_fail_jobs(
+                        conn, job_ids,
+                        f"handoff depth cap {max_depth} exhausted "
+                        f"without final_answer",
+                    )
+                return {"written": 0, "result": disp,
+                        "reason": "handoff depth exhausted"}
+        except Exception as e:
+            logger.exception("writer agent failed")
+            with get_conn() as conn:
+                disp = wiki_jobs.release_or_fail_jobs(conn, job_ids, f"agent error: {e}")
+            return {"written": 0, "result": disp, "reason": str(e)}
+    finally:
+        release_handoff_slot(handoff_token)
 
     used_section_edits = False
     if not (res.body or "").strip():

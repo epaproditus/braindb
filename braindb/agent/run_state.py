@@ -70,3 +70,55 @@ def record_submit(payload: Any) -> None:
     slot = _slot_var.get()
     if slot is not None:
         slot.value = payload
+
+
+# ====================================================================== #
+# Handoff side-channel (writer-only)                                      #
+# ====================================================================== #
+#
+# Parallels the final-answer slot above. The writer's `handoff_to_successor`
+# tool parks its brief here; the run wrapper in `routers/wiki.py` reads it
+# after `run_typed` returns and decides whether to spawn a successor. Lives
+# in run_state.py (not in a writer-specific module) so the slot lifecycle
+# uses the same ContextVar discipline — install in the wrapper, mutate in
+# the tool body, isolated across nested runs.
+
+
+class _HandoffSlot:
+    """One-shot holder for the writer's handoff brief. Distinct from
+    `_Slot` because the wrapper inspects two independent fields
+    (progress + remaining) rather than a single typed payload."""
+    __slots__ = ("captured", "progress_summary", "remaining_work")
+
+    def __init__(self) -> None:
+        self.captured: bool = False
+        self.progress_summary: str = ""
+        self.remaining_work: str = ""
+
+
+_handoff_slot_var: ContextVar["_HandoffSlot | None"] = ContextVar(
+    "braindb_handoff_slot", default=None,
+)
+
+
+def install_handoff_slot() -> tuple[_HandoffSlot, object]:
+    """Used by the writer's run wrapper to start a run that may end via
+    handoff. Returns `(slot, token)`; pass `token` to `release_handoff_slot`
+    in a `finally:`."""
+    slot = _HandoffSlot()
+    token = _handoff_slot_var.set(slot)
+    return slot, token
+
+
+def release_handoff_slot(token: object) -> None:
+    _handoff_slot_var.reset(token)  # type: ignore[arg-type]
+
+
+def record_handoff(progress_summary: str, remaining_work: str) -> None:
+    """Called from the `handoff_to_successor` tool body. Mutates the slot
+    in place (same reason as `record_submit`)."""
+    slot = _handoff_slot_var.get()
+    if slot is not None:
+        slot.captured = True
+        slot.progress_summary = progress_summary
+        slot.remaining_work = remaining_work

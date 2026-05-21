@@ -47,6 +47,7 @@ from braindb.agent.tools import (
     generate_embeddings,
     get_entity,
     get_stats,
+    handoff_to_successor,
     ingest_file,
     list_entities,
     quick_search,
@@ -162,14 +163,23 @@ def _model() -> LitellmModel:
     )
 
 
-def _build(name: str, submit_tool, extra_tools: tuple = ()) -> Agent:
+def _build(
+    name: str,
+    submit_tool,
+    extra_tools: tuple = (),
+    extra_stop_tools: tuple[str, ...] = (),
+) -> Agent:
     """Build an agent. NOTE: no `output_type` — see module docstring. The
     structured contract lives on `submit_tool`'s argument schema, not on
     the agent.
 
     `extra_tools` lets a specific agent (currently only the writer) carry
-    role-specific tools (the wiki section-edit tools) without polluting
-    `_BASE_TOOLS` shared by all agents.
+    role-specific tools (the wiki section-edit tools + handoff) without
+    polluting `_BASE_TOOLS` shared by all agents.
+
+    `extra_stop_tools` adds extra stop-tool names beyond `final_answer`.
+    The writer adds `handoff_to_successor` here so the run halts cleanly
+    when handoff is called instead of continuing wastefully.
     """
     set_tracing_disabled(disabled=True)
     agent = Agent(
@@ -178,7 +188,9 @@ def _build(name: str, submit_tool, extra_tools: tuple = ()) -> Agent:
         model=_model(),
         model_settings=ModelSettings(),
         tools=[*_BASE_TOOLS, *extra_tools, submit_tool],
-        tool_use_behavior=StopAtTools(stop_at_tool_names=["final_answer"]),
+        tool_use_behavior=StopAtTools(
+            stop_at_tool_names=["final_answer", *extra_stop_tools],
+        ),
     )
     logger.info(
         "Agent built: %s (model=%s) — free middle turns, typed final_answer",
@@ -190,26 +202,39 @@ def _build(name: str, submit_tool, extra_tools: tuple = ()) -> Agent:
 _cache: dict[str, Agent] = {}
 
 
-def _cached(key: str, name: str, submit_tool, extra_tools: tuple = ()) -> Agent:
+def _cached(
+    key: str,
+    name: str,
+    submit_tool,
+    extra_tools: tuple = (),
+    extra_stop_tools: tuple[str, ...] = (),
+) -> Agent:
     a = _cache.get(key)
     if a is None:
-        a = _build(name, submit_tool, extra_tools=extra_tools)
+        a = _build(
+            name, submit_tool,
+            extra_tools=extra_tools,
+            extra_stop_tools=extra_stop_tools,
+        )
         _cache[key] = a
     return a
 
 
-# Writer-only tools: section read/edit/delete + grammar validation. The
-# writer rewrites whole wiki bodies today; these let it edit one section
-# at a time so big wikis don't blow the context window. See
+# Writer-only tools: section read/edit/delete + grammar validation +
+# context-handoff. The writer rewrites whole wiki bodies today; section
+# tools let it edit one at a time, and `handoff_to_successor` lets it
+# bail to a fresh agent when context approaches the wall. See
 # braindb/services/wiki_sections.py + plan
 # `feat/wikis-and-maintainer-agent-read-write-tools`.
-_WRITER_SECTION_TOOLS = (
+_WRITER_EXTRA_TOOLS = (
     read_wiki_outline,
     read_wiki_section,
     edit_wiki_section,
     delete_wiki_section,
     validate_wiki,
+    handoff_to_successor,
 )
+_WRITER_EXTRA_STOP_TOOLS = ("handoff_to_successor",)
 
 
 def get_agent() -> Agent:
@@ -224,7 +249,8 @@ def get_maintainer_agent() -> Agent:
 def get_writer_agent() -> Agent:
     return _cached(
         "writer", "BrainDB Wiki Writer", submit_wiki,
-        extra_tools=_WRITER_SECTION_TOOLS,
+        extra_tools=_WRITER_EXTRA_TOOLS,
+        extra_stop_tools=_WRITER_EXTRA_STOP_TOOLS,
     )
 
 
@@ -242,6 +268,8 @@ async def run_typed(
     agent: Agent,
     expected_cls: type[T],
     max_turns: int | None = None,
+    *,
+    token_budget: int = 0,
 ) -> T:
     """Run a typed agent and return the validated Pydantic instance it
     submitted. The instance is guaranteed-valid because the SDK validates
@@ -252,6 +280,13 @@ async def run_typed(
     (e.g. `max_turns` exhausted) — surfaces a real model failure instead
     of silently returning bad data. Routers handle this like any other
     agent error: log + release the job lease + 5xx.
+
+    `token_budget` (writer-only, opt-in): when > 0, enables the handoff
+    nudge in `CountdownHooks` — at the first LLM call where the cheap
+    token estimate of the conversation exceeds this budget, one
+    synthetic user message instructs the model to call
+    `handoff_to_successor`. The successor-respawn loop lives in the
+    caller (see `braindb/routers/wiki.py`).
     """
     turns = max_turns or settings.agent_max_turns
     slot, token = install_slot()
@@ -259,10 +294,16 @@ async def run_typed(
     # appends a synthetic "you have N turns left, finalise via final_answer"
     # user message to the conversation. One nudge per run; disabled when
     # `agent_countdown_threshold == 0`. See braindb/agent/hooks.py.
+    # When `token_budget > 0` (writer path) the same hook also watches
+    # estimated prompt tokens and injects ONE handoff nudge at the first
+    # call where the estimate crosses the budget. Independent fired-once
+    # flag from the turn nudge.
     hooks = CountdownHooks(
         max_turns=turns,
         threshold=settings.agent_countdown_threshold,
         tool_name="final_answer",
+        token_budget=token_budget,
+        handoff_tool_name="handoff_to_successor",
     )
     try:
         logger.info("Running typed query (%s): %s", agent.name, query[:160])

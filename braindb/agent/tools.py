@@ -36,7 +36,7 @@ from braindb.services.keyword_service import (
 )
 from braindb.services.search import fuzzy_search, preview, slice_content
 from braindb.services import wiki_sections as ws
-from braindb.agent.run_state import record_submit
+from braindb.agent.run_state import record_handoff, record_submit
 from braindb.agent.schemas import (
     AgentAnswer,
     MaintainerDecision,
@@ -1071,6 +1071,49 @@ async def validate_wiki(wiki_id: str) -> str:
         )
     except Exception as e:
         return _err(str(e))
+
+
+# ====================================================================== #
+# CONTEXT HANDOFF — end this run, successor continues (writer-only)      #
+# ====================================================================== #
+#
+# Called by the writer when it gets a context-near-full nudge from
+# `CountdownHooks` and decides remaining work doesn't fit. The router's
+# writer wrapper (braindb/routers/wiki.py) detects the handoff slot was
+# filled and spawns a successor agent — same prompt, same tools, fresh
+# context, seeded with the brief.
+#
+# The tool ALSO parks a placeholder `WikiWriteResult` via `record_submit`
+# so `run_typed`'s typed-final contract is satisfied — the placeholder
+# is never the authoritative output; the wrapper reads the handoff slot
+# instead. This avoids any change to `run_typed`'s shape.
+
+@function_tool
+@_verbose("handoff_to_successor")
+async def handoff_to_successor(progress_summary: str, remaining_work: str) -> str:
+    """End this run early; a successor with the SAME prompt and tools
+    will continue from your brief. Use when you've been nudged about
+    context approaching the limit AND remaining work doesn't fit in 1-2
+    turns.
+
+    Args:
+        progress_summary: Tools you've called, key findings, and any
+            ACTIVE revision tokens (for the wiki you've been editing).
+            The successor only sees this — be precise.
+        remaining_work: The concrete next tool call(s) the successor
+            must make — name wikis, section names, current revisions.
+            Example: "Call read_wiki_section(wiki_id='abc', section_name='timeline')
+            with expect_revision=15, then edit_wiki_section(...) with the
+            new timeline content merging facts from member fact-id xyz."
+    """
+    record_handoff(progress_summary, remaining_work)
+    # Park a placeholder WikiWriteResult so run_typed's typed-final
+    # contract is satisfied. mode/body are intentionally minimal — the
+    # router consults the handoff slot first when this run ends. The
+    # writer's StopAtTools list includes `handoff_to_successor`, so
+    # the loop halts cleanly after this returns.
+    record_submit(WikiWriteResult(mode="attach", body=""))
+    return "handoff registered; this run is ending — successor will continue from your brief"
 
 
 # ====================================================================== #
