@@ -198,6 +198,33 @@ def _members_block(members: list[dict]) -> str:
     return "\n".join(out)
 
 
+# Above this character count, an attach's `%%CURRENT_BODY%%` is replaced
+# by a stub pointing at the section-edit tools. Keeps the writer's
+# INITIAL prompt small so it never bumps into the model window before
+# it can run a single tool — the section tools (Phase 1) are designed
+# exactly for navigating a body without inlining it.
+_INLINE_BODY_MAX_CHARS = 4000
+
+
+def _body_block_or_stub(mode: str, wiki_id: str | None, old_body: str) -> str:
+    """For attach mode with a body too large to safely inline, return a
+    stub directing the agent to use the section tools instead. Small
+    bodies and other modes inline as before."""
+    if not old_body:
+        return "(none — create mode)"
+    if mode == "attach" and wiki_id and len(old_body) > _INLINE_BODY_MAX_CHARS:
+        return (
+            f"[BODY OMITTED — {len(old_body)} chars, too large to inline.\n"
+            f"Use the section tools to navigate without consuming context:\n"
+            f"  - read_wiki_outline(\"{wiki_id}\") — section list + sizes + revision\n"
+            f"  - read_wiki_section(\"{wiki_id}\", \"<section_name>\") — one section\n"
+            f"  - edit_wiki_section(...) per section, validate_wiki, then\n"
+            f"    final_answer(mode=\"attach\", body=\"\") — router persists via\n"
+            f"    section edits and skips the full-body write.]"
+        )
+    return old_body
+
+
 @router.post("/write")
 async def wiki_write():
     """
@@ -271,7 +298,7 @@ async def wiki_write():
         .replace("%%CANONICAL%%", canonical)
         .replace("%%WIKI_ID%%", bucket["target_wiki_id"] or "(assigned after write)")
         .replace("%%MEMBERS%%", _members_block(members))
-        .replace("%%CURRENT_BODY%%", old_body or "(none — create mode)")
+        .replace("%%CURRENT_BODY%%", _body_block_or_stub(mode, bucket.get("target_wiki_id"), old_body))
         .replace("%%DUPLICATES%%", _dupes_block(dupes))
     )
     # Capture pre-run revision on the target wiki for `attach` mode so we

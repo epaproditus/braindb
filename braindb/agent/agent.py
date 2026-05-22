@@ -27,6 +27,7 @@ from typing import TypeVar
 
 from agents import Agent, ModelSettings, Runner, StopAtTools, set_tracing_disabled
 from agents.extensions.models.litellm_model import LitellmModel
+from litellm import BadRequestError, ContextWindowExceededError
 from pydantic import BaseModel
 
 from braindb.agent.hooks import CountdownHooks
@@ -270,6 +271,7 @@ async def run_typed(
     max_turns: int | None = None,
     *,
     token_budget: int = 0,
+    _bad_request_retried: bool = False,
 ) -> T:
     """Run a typed agent and return the validated Pydantic instance it
     submitted. The instance is guaranteed-valid because the SDK validates
@@ -393,6 +395,33 @@ async def run_typed(
             f"{expected_cls.__name__} (got {type(payload).__name__}). "
             f"The run terminated without the typed final tool firing — "
             f"the model likely ended with plain prose."
+        )
+    except ContextWindowExceededError:
+        # The conversation is already over the model's window. A retry
+        # without input truncation would just hit the same wall, so we
+        # re-raise and let the router fail the job cleanly. Real fix is
+        # upstream: keep prompts/tool-results small enough that the
+        # handoff threshold catches us first. See routers/wiki.py's
+        # `_body_block_or_stub` for the prompt-side mitigation.
+        raise
+    except BadRequestError as e:
+        # Quantised models (Qwen AWQ-INT4) occasionally emit malformed
+        # JSON in tool-call args; the OpenAI client raises BadRequestError
+        # before the tool body runs. One fresh attempt usually recovers.
+        # Bounded to depth 1 via the `_bad_request_retried` flag —
+        # recursion uses run_typed itself rather than duplicating the
+        # setup. The current slot is released by `finally`; the recursive
+        # call installs its own.
+        if _bad_request_retried:
+            raise
+        logger.warning(
+            "%s: BadRequestError on first attempt (%s); "
+            "retrying once with a fresh run", agent.name, str(e)[:160],
+        )
+        return await run_typed(
+            query, agent, expected_cls,
+            max_turns=max_turns, token_budget=token_budget,
+            _bad_request_retried=True,
         )
     finally:
         release_slot(token)
