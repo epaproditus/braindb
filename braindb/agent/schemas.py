@@ -55,6 +55,15 @@ def _maybe_parse_json_string(v):
             parsed = json.loads(v)
         except (json.JSONDecodeError, ValueError):
             return v  # let Pydantic raise its normal error
+        # Defensive: occasionally Qwen-class quantised models emit the dict
+        # double-escaped (the first parse yields a string of JSON, not a
+        # dict). One more parse attempt unwraps that case. Safe — only fires
+        # on a string result, only returns a value if it parses to a dict.
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except (json.JSONDecodeError, ValueError):
+                return v
         # Only return the parsed value if it's a dict — anything else (list,
         # int, null) is not a valid Pydantic-model input; let Pydantic raise.
         if isinstance(parsed, dict):

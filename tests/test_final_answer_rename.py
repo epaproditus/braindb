@@ -669,6 +669,18 @@ def test_subagent_result_accepts_json_string_payload() -> None:
     assert s.result == "Found 3 entities matching the subject."
 
 
+def test_double_escaped_json_payload_unwraps() -> None:
+    """Qwen-AWQ-INT4 occasionally double-escapes the tool-call args (first
+    parse yields a JSON string, not a dict). Validator should unwrap one
+    extra level. Compliant providers are unaffected because they send a
+    dict and never enter the string branch at all."""
+    import json as _json
+    # Outer string -> inner string -> dict ({"answer": "..."})
+    double = _json.dumps(_json.dumps({"answer": "from double-escape"}))
+    a = AgentAnswer.model_validate(double)
+    assert a.answer == "from double-escape"
+
+
 def test_dict_payload_still_passes_through_unchanged() -> None:
     """The whole point of mode='before' is to leave well-behaved provider
     output untouched. A regular dict input must validate exactly as
