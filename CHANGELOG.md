@@ -19,6 +19,11 @@ the same hands-off posture as the file watcher.
   wiki, *create* a new one, *consolidate* duplicates, or *skip*. A separate
   writer agent then researches and writes/maintains each page, citing every
   claim with `[[ref:UUID]]`, with auto-self-healing on conflated subjects.
+- **Wiki HTTP endpoints**: `POST /api/v1/wiki/cron` (orphan scan, idempotent),
+  `POST /api/v1/wiki/maintain` (one triage decision per call),
+  `POST /api/v1/wiki/write` (one writer pass), `GET /api/v1/wiki/jobs`
+  (queue visibility). Normal operation is the scheduler sidecar; these are
+  for hand-driving / observability.
 - **Wiki section-edit tools**: `read_wiki_outline`, `read_wiki_section`,
   `edit_wiki_section`, `delete_wiki_section`, `validate_wiki` — let the
   writer do surgical edits on large pages without rewriting the full body.
@@ -45,6 +50,21 @@ the same hands-off posture as the file watcher.
 - **CI**: minimal GitHub Actions workflow runs the typed-final + handoff
   unit tests on every PR + push to main.
 
+### Configurable
+
+New environment variables exposed in `.env.example` and consumed by the
+api / wiki scheduler:
+
+- `WIKI_ENABLED` — opt-in flag for the wiki scheduler (default `false`).
+- `WIKI_INTERVAL` — scheduler tick in seconds (default `60`).
+- `WIKI_FRESHNESS_MINUTES` — orphan eligibility gate; an entity must be
+  this old before it's picked up for triage (default `30`).
+- `WIKI_ATTACH_COOLDOWN_SECONDS` — per-wiki throttle between attach claims.
+- `WIKI_AGENT_TIMEOUT` — HTTP timeout the scheduler uses for maintainer /
+  writer calls (default `1200` seconds, i.e. 20 minutes).
+- `AGENT_VERBOSE` — log every agent tool call with args and result preview
+  (default `false`).
+
 ### Changed
 
 - **Recall is keyword-mediated**: `/memory/context` now matches both the
@@ -53,6 +73,11 @@ the same hands-off posture as the file watcher.
   (per-search-term + per-keyword, geometric decay) prevents one popular
   hub keyword from monopolising top-N. Narrow short queries outperform
   long phrases for keyword recall.
+- **Multi-item recall returns previews**: `/memory/context` and
+  `list_entities` now return short (~1 KB) previews per item; the full
+  body is fetched on demand via `GET /api/v1/entities/{id}`, with optional
+  `?offset=&limit=` paging for large documents. Keeps the LLM-visible
+  context tight without losing access to the underlying content.
 - **`deepinfra` (`google/gemma-4-31B-it`) promoted as the recommended
   default** across README, BRAINDB_GUIDE, CLAUDE, and CONTRIBUTING. Fast
   (5–30s per agent call), cheap, validated end-to-end. The `vllm_*`
@@ -90,10 +115,16 @@ the same hands-off posture as the file watcher.
   explicitly via `docker compose up -d --no-deps --force-recreate api`,
   preventing mid-run reloads that broke in-flight LLM calls.
 
-### Security / privacy
+### Upgrading from 0.1.0
 
-- Documentation purged of one personal surname; example wiki content
-  genericised. No secrets ever lived in tracked files.
+Migration `005_wiki_system.py` adds two new tables (`wikis_ext`,
+`wiki_job`) and the `wiki` entity type. It runs automatically on
+container startup via `alembic upgrade head` (already in the api
+`command`). Existing rows are untouched; no manual action required.
+
+The wiki scheduler ships **disabled by default** — set
+`WIKI_ENABLED=true` in `.env` to opt in. This prevents an upgraded
+deployment from spending on the LLM until the operator says go.
 
 ## [0.1.0] — initial public baseline
 
