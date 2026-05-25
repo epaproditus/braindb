@@ -280,6 +280,17 @@ function renderRelations(relations) {
     return;
   }
 
+  // Dedupe by (relation_type, from, to) — DB can have duplicate edge rows
+  // (especially for tagged_with) from ingest race conditions; collapse them.
+  const seenKey = new Set();
+  const deduped = relations.filter(r => {
+    const k = `${r.relation_type}|${r.from_entity_id}|${r.to_entity_id}`;
+    if (seenKey.has(k)) return false;
+    seenKey.add(k);
+    return true;
+  });
+  relations = deduped;
+
   // Group by relation_type
   const groups = {};
   for (const r of relations) {
@@ -293,11 +304,15 @@ function renderRelations(relations) {
     h.textContent = `${type} (${rows.length})`;
     g.appendChild(h);
     for (const r of rows) {
+      const target = r.to_entity_id || r.from_entity_id;
       const row = document.createElement("div");
       row.className = "relation-row";
-      row.dataset.id = r.to_entity_id || r.from_entity_id;
+      row.dataset.id = target;
       row.innerHTML = `
-        <div>${escapeHtml(r.to_entity_label || r.from_entity_label || r.to_entity_id || r.from_entity_id)}</div>
+        <span class="entity-chip" data-resolve-id="${escapeHtml(target)}">
+          <span class="type-pill type-unknown">…</span>
+          <span class="entity-name">${escapeHtml((target || "").slice(0, 8))}</span>
+        </span>
         ${r.description ? `<span class="preview">${escapeHtml(r.description)}</span>` : ""}
       `;
       row.addEventListener("click", () => openEntityDrawer(row.dataset.id));
@@ -307,6 +322,7 @@ function renderRelations(relations) {
   }
 
   panel.hidden = false;
+  resolveAndPatch(body);
 }
 
 // ============================================================
@@ -328,9 +344,12 @@ async function openEntityDrawer(id) {
     return;
   }
 
+  const titleLabel = previewCanonicalName(entity.content)
+                  || entitySnippet(entity.content, entity.entity_type === "wiki").slice(0, 60)
+                  || id.slice(0, 8);
   title.textContent = entity.entity_type
-    ? `${entity.entity_type} · ${id.slice(0, 8)}`
-    : id.slice(0, 8);
+    ? `${entity.entity_type} · ${titleLabel}`
+    : titleLabel;
 
   const sourcePill = entity.source
     ? `<span class="pill">source: ${escapeHtml(entity.source)}</span>` : "";
@@ -340,20 +359,61 @@ async function openEntityDrawer(id) {
     ? `<span class="pill">importance: ${entity.importance}</span>` : "";
 
   const isWiki = entity.entity_type === "wiki";
+  const isDatasource = entity.entity_type === "datasource";
+  const isSource = entity.entity_type === "source";
   const rendered = renderWiki(entity.content || "");
   const contentHtml = isWiki
     ? `<div class="wiki-content">${rendered.html}</div>`
-    : `<pre>${escapeHtml(entity.content || "")}</pre>`;
+    : `<pre id="drawer-content-pre">${escapeHtml(entity.content || "")}</pre>`;
 
+  // Top action row: "Open full wiki" for wikis; external URL for source.
+  // file_path is NOT a clickable link — browsers block file:// from http://
+  // pages — instead it's rendered as copy-able text in the meta strip below.
+  const actions = [];
+  if (isWiki) {
+    actions.push(`<a class="drawer-action" href="#/wiki/${id}" data-close-drawer="entity">Open full wiki →</a>`);
+  }
+  if ((isSource || isDatasource) && entity.url) {
+    actions.push(`<a class="drawer-action" href="${escapeHtml(entity.url)}" target="_blank" rel="noopener">Open URL ↗</a>`);
+  }
+  const actionsRow = actions.length ? `<div class="drawer-actions-row">${actions.join("")}</div>` : "";
+
+  // For datasources / sources with a local file_path, show it as copy-able text
+  // (no broken file:// link).
+  const filePathRow = ((isSource || isDatasource) && entity.file_path)
+    ? `<div class="entity-filepath" title="Local file path — copy and open in your file manager"><span class="filepath-label">File:</span> <code>${escapeHtml(entity.file_path)}</code></div>`
+    : "";
+
+  // Pagination hint for big bodies (datasources especially)
+  const meta = entity.content_meta || {};
+  const hasMore = meta.next_offset != null;
+  const loadMoreRow = hasMore
+    ? `<button id="drawer-load-more" class="drawer-action secondary" data-next-offset="${meta.next_offset}">Load more (chunk ${meta.chunk_index + 1 || "?"}) ↓</button>`
+    : "";
+
+  // Dedupe relations by (relation_type, opposite endpoint) — backend or
+  // earlier ingest bug can produce duplicate rows; show each pair once.
   let relationsHtml = "";
   if (relations && relations.length) {
+    const seenKey = new Set();
+    const deduped = relations.filter(r => {
+      const opp = r.to_entity_id === id ? r.from_entity_id : r.to_entity_id;
+      const k = `${r.relation_type}|${opp}`;
+      if (seenKey.has(k)) return false;
+      seenKey.add(k);
+      return true;
+    });
     const groups = {};
-    for (const r of relations) (groups[r.relation_type] ||= []).push(r);
+    for (const r of deduped) (groups[r.relation_type] ||= []).push(r);
     const groupHtml = Object.entries(groups).sort().map(([type, rows]) => {
       const items = rows.map(r => {
-        const target = r.to_entity_id || r.from_entity_id;
-        const label = r.to_entity_label || r.from_entity_label || target;
-        return `<div class="relation-row" data-id="${target}"><div>${escapeHtml(label)}</div></div>`;
+        const target = r.to_entity_id === id ? r.from_entity_id : r.to_entity_id;
+        return `<div class="relation-row" data-id="${target}">
+          <span class="entity-chip" data-resolve-id="${escapeHtml(target)}">
+            <span class="type-pill type-unknown">…</span>
+            <span class="entity-name">${escapeHtml((target || "").slice(0, 8))}</span>
+          </span>
+        </div>`;
       }).join("");
       return `<div class="relations-group"><h4>${type} (${rows.length})</h4>${items}</div>`;
     }).join("");
@@ -361,13 +421,50 @@ async function openEntityDrawer(id) {
   }
 
   body.innerHTML = `
+    ${actionsRow}
     <div class="entity-meta">${sourcePill}${certPill}${impPill}</div>
+    ${filePathRow}
     <div class="entity-section">
       <h4>Content</h4>
       ${contentHtml}
+      ${loadMoreRow}
     </div>
     ${relationsHtml}
   `;
+
+  // Resolve all chip placeholders inside the drawer (relations block)
+  resolveAndPatch(body);
+
+  // Wire "Open full wiki" / external link to also close the drawer cleanly
+  $$('.drawer-action[data-close-drawer]', body).forEach(a => {
+    a.addEventListener("click", () => closeDrawer($("#entity-drawer")));
+  });
+
+  // Wire "Load more" pagination for big bodies
+  const loadMoreBtn = $("#drawer-load-more", body);
+  if (loadMoreBtn) {
+    loadMoreBtn.addEventListener("click", async () => {
+      loadMoreBtn.disabled = true;
+      loadMoreBtn.textContent = "Loading…";
+      try {
+        const offset = parseInt(loadMoreBtn.dataset.nextOffset, 10);
+        const next = await apiGet(`/entities/${id}?offset=${offset}&limit=4000`);
+        const pre = $("#drawer-content-pre", body);
+        if (pre) pre.textContent += next.content || "";
+        // Update / remove button based on next.content_meta.next_offset
+        const nm = next.content_meta || {};
+        if (nm.next_offset != null) {
+          loadMoreBtn.dataset.nextOffset = nm.next_offset;
+          loadMoreBtn.textContent = `Load more (chunk ${(nm.chunk_index || 0) + 1}) ↓`;
+          loadMoreBtn.disabled = false;
+        } else {
+          loadMoreBtn.remove();
+        }
+      } catch (e) {
+        loadMoreBtn.textContent = `Failed: ${e.message}`;
+      }
+    });
+  }
 
   // Drill-down: clicking a relation in the drawer swaps the drawer to that entity
   $$(".relation-row", body).forEach(row => {
@@ -522,6 +619,8 @@ async function openGraph(seedId) {
 
 function initGraph() {
   // Toolbar buttons
+  $("#graph-zoom-in").addEventListener("click", () => graph.zoomIn());
+  $("#graph-zoom-out").addEventListener("click", () => graph.zoomOut());
   $("#graph-fit").addEventListener("click", () => graph.fit());
   $("#graph-reset").addEventListener("click", () => {
     graph.reset();
@@ -551,9 +650,18 @@ function initGraph() {
         const id = it.id || it.entity_id;
         const type = it.entity_type || "?";
         const label = (previewCanonicalName(it.content) || (it.content || "").split("\n")[0] || id).slice(0, 60);
+
+        // Only wikis carry a retired flag. wikiIndexCache (loaded at app
+        // boot) has retired_at for every wiki — reuse it.
+        let retiredTag = "";
+        if (type === "wiki" && wikiIndexCache) {
+          const w = wikiIndexCache.find(x => x.id === id);
+          if (w && w.retired_at) retiredTag = ` <span class="retired-tag">retired</span>`;
+        }
+
         const row = document.createElement("div");
         row.className = "result-item";
-        row.innerHTML = `<span class="result-type">${escapeHtml(type)}</span> ${escapeHtml(label)}`;
+        row.innerHTML = `<span class="result-type">${escapeHtml(type)}</span> ${escapeHtml(label)}${retiredTag}`;
         row.addEventListener("click", async () => {
           results.hidden = true;
           input.value = "";
@@ -625,6 +733,12 @@ async function loadStats() {
   }
 }
 
+function actorOf(jobType) {
+  if (jobType === "triage") return "MAINTAINER";
+  if (jobType === "attach" || jobType === "create" || jobType === "consolidate") return "WRITER";
+  return "SCHEDULER";
+}
+
 async function loadJobs() {
   try {
     const jobs = await data.jobs();
@@ -634,33 +748,121 @@ async function loadJobs() {
       return;
     }
     const rows = items.slice(0, 100).map(j => {
-      const cls = (j.status === "pending" && j.job_type === "consolidate")
-        ? "highlight-consolidate" : "";
+      const classes = [];
+      if (j.status === "pending" && j.job_type === "consolidate") classes.push("highlight-consolidate");
+      if (j.status === "failed") classes.push("row-failed");
+      // The wiki_job table has TWO note columns: `rationale` (LLM's reasoning,
+      // benign) and `last_error` (real errors). Show whichever is set; only
+      // colour as an error when status='failed' AND we actually have a
+      // last_error message.
+      const note = j.rationale || j.last_error || "";
+      const isRealError = j.status === "failed" && j.last_error;
+      const actor = actorOf(j.job_type);
+      const firstEntity = (j.entity_ids && j.entity_ids[0]) || "";
+
+      const chip = (id) => id
+        ? `<span class="entity-chip" data-resolve-id="${escapeHtml(id)}">
+             <span class="type-pill type-unknown">…</span>
+             <span class="entity-name">${escapeHtml(id.slice(0, 8))}</span>
+           </span>`
+        : `<span class="ink-muted">—</span>`;
+
       return `
-        <tr class="${cls}">
-          <td class="id-cell" title="${escapeHtml(j.id)}">${escapeHtml((j.id || "").slice(0, 8))}</td>
+        <tr class="${classes.join(" ")}" title="job ${escapeHtml(j.id)} · attempts ${j.attempts ?? 0}">
+          <td><span class="actor-pill actor-${actor.toLowerCase()}">${actor}</span></td>
           <td>${escapeHtml(j.job_type || "")}</td>
           <td>${escapeHtml(j.status || "")}</td>
-          <td class="id-cell">${escapeHtml((j.target_wiki_id || "").slice(0, 8))}</td>
-          <td>${escapeHtml(j.created_at || "")}</td>
-          <td>${j.attempts != null ? j.attempts : ""}</td>
-          <td class="context">${escapeHtml(j.last_error || "")}</td>
+          <td>${chip(j.target_wiki_id)}</td>
+          <td>${chip(firstEntity)}</td>
+          <td>${escapeHtml((j.created_at || "").slice(0, 19))}</td>
+          <td class="context ${isRealError ? "context-error" : ""}">${escapeHtml(note)}</td>
         </tr>
       `;
     }).join("");
     $("#ops-jobs").innerHTML = `
       <table class="ops-table">
         <thead><tr>
-          <th>id</th><th>type</th><th>status</th><th>target</th>
-          <th>created</th><th>tries</th><th>last_error</th>
+          <th>actor</th><th>action</th><th>status</th><th>target wiki</th>
+          <th>entity</th><th>created</th><th>note</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
     `;
+    resolveAndPatch($("#ops-jobs"));
   } catch (e) {
     console.error("loadJobs failed:", e);
     $("#ops-jobs").innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
   }
+}
+
+// ============================================================
+// Universal entity resolver — no raw UUIDs anywhere in the UI.
+// ============================================================
+// Caches the full entity object by id so renderers can reach for type +
+// canonical name + preview without round-tripping the API every time.
+const entityCache = new Map();
+const entityInflight = new Map();          // id → Promise (dedupe concurrent fetches)
+
+async function resolveEntity(id) {
+  if (!id) return null;
+  if (entityCache.has(id)) return entityCache.get(id);
+  if (entityInflight.has(id)) return entityInflight.get(id);
+  // Fast path: wikiIndexCache (loaded once at boot, covers all wikis).
+  if (wikiIndexCache) {
+    const w = wikiIndexCache.find(x => x.id === id);
+    if (w) { entityCache.set(id, w); return w; }
+  }
+  const p = data.entity(id).then(e => {
+    entityCache.set(id, e || null);
+    entityInflight.delete(id);
+    return e;
+  }).catch(() => {
+    entityCache.set(id, null);
+    entityInflight.delete(id);
+    return null;
+  });
+  entityInflight.set(id, p);
+  return p;
+}
+
+// HTML for a resolved entity chip: small type-pill + canonical-name / snippet.
+// Falls back to short-UUID if the entity hasn't resolved yet.
+function entityChipHtml(entity, idFallback = "") {
+  if (!entity) {
+    return `<span class="entity-chip"><span class="type-pill type-unknown">?</span><span class="entity-name">${escapeHtml((idFallback || "").slice(0, 8))}</span></span>`;
+  }
+  const t = entity.entity_type || "?";
+  const isWiki = t === "wiki";
+  const label = previewCanonicalName(entity.content)
+              || entitySnippet(entity.content, isWiki).slice(0, 60)
+              || (entity.id || "").slice(0, 8);
+  return `<span class="entity-chip" title="${escapeHtml(entity.id)}"><span class="type-pill type-${escapeHtml(t)}">${escapeHtml(t)}</span><span class="entity-name">${escapeHtml(label)}</span></span>`;
+}
+
+// After rendering a section that contains placeholder chips (elements with
+// `data-resolve-id`), batch-fetch all the IDs and patch each chip in-place.
+// Uses cached entities when available — first paint is the only one that hits
+// the network.
+async function resolveAndPatch(root) {
+  if (!root) return;
+  const slots = $$(".entity-chip[data-resolve-id]", root);
+  const ids = [...new Set(slots.map(s => s.dataset.resolveId).filter(Boolean))];
+  if (ids.length === 0) return;
+  await Promise.all(ids.map(id => resolveEntity(id)));
+  slots.forEach(s => {
+    const id = s.dataset.resolveId;
+    const e = entityCache.get(id);
+    if (e) s.outerHTML = entityChipHtml(e, id);
+  });
+}
+
+function logActorOf(operation) {
+  const op = (operation || "").toLowerCase();
+  if (op.startsWith("wiki_maintain") || op.includes("triage")) return "MAINTAINER";
+  if (op.startsWith("wiki_write") || op.includes("attach") || op.includes("create") || op.includes("consolidate")) return "WRITER";
+  if (op.startsWith("wiki_cron") || op.includes("schedule")) return "SCHEDULER";
+  if (op.startsWith("ingest") || op.includes("watch")) return "WATCHER";
+  return "SYSTEM";
 }
 
 async function loadLog() {
@@ -671,24 +873,33 @@ async function loadLog() {
       $("#ops-log").innerHTML = `<div class="empty">No recent activity.</div>`;
       return;
     }
-    const rows = items.slice(0, 50).map(l => `
-      <tr>
-        <td>${escapeHtml(l.timestamp || "")}</td>
-        <td>${escapeHtml(l.operation || "")}</td>
-        <td>${escapeHtml(l.entity_type || "")}</td>
-        <td class="id-cell" title="${escapeHtml(l.entity_id || "")}">${escapeHtml((l.entity_id || "").slice(0, 8))}</td>
-        <td class="context">${escapeHtml(l.context_note || "")}</td>
-      </tr>
-    `).join("");
+    const rows = items.slice(0, 50).map(l => {
+      const actor = logActorOf(l.operation);
+      const entityCell = l.entity_id
+        ? `<span class="entity-chip" data-resolve-id="${escapeHtml(l.entity_id)}">
+             <span class="type-pill type-unknown">…</span>
+             <span class="entity-name">${escapeHtml(l.entity_id.slice(0, 8))}</span>
+           </span>`
+        : `<span class="ink-muted">—</span>`;
+      return `
+        <tr>
+          <td>${escapeHtml((l.timestamp || "").slice(0, 19))}</td>
+          <td><span class="actor-pill actor-${actor.toLowerCase()}">${actor}</span></td>
+          <td>${escapeHtml(l.operation || "")}</td>
+          <td>${entityCell}</td>
+          <td class="context">${escapeHtml(l.context_note || "")}</td>
+        </tr>
+      `;
+    }).join("");
     $("#ops-log").innerHTML = `
       <table class="ops-table">
         <thead><tr>
-          <th>timestamp</th><th>operation</th><th>entity_type</th>
-          <th>entity</th><th>note</th>
+          <th>when</th><th>actor</th><th>operation</th><th>entity</th><th>note</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
     `;
+    resolveAndPatch($("#ops-log"));
   } catch (e) {
     console.error("loadLog failed:", e);
     $("#ops-log").innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;

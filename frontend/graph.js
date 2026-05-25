@@ -104,9 +104,15 @@ function nodeConfig(entity) {
         size: 10 };
     case "source":
     case "datasource":
+      // vis-network's `database` shape puts the label INSIDE and ignores
+      // `size`; constrain width + shrink font so the cylinder stays small
+      // regardless of how long the label is.
       return { ...base, shape: "database",
         color: { background: c.teal, border: c.teal },
-        font: { ...base.font, color: c.inkSoft } };
+        font: { ...base.font, color: c.paper, size: 9 },
+        widthConstraint: { maximum: 70 },
+        heightConstraint: { minimum: 18 },
+        margin: 4 };
     case "rule":
       // `box` shape contains its label INSIDE, so white-on-purple is fine.
       return { ...base, shape: "box",
@@ -212,16 +218,19 @@ export function ensureMounted(container, onNodeClick) {
         enabled: true,
         iterations: 250,
         updateInterval: 25,
-        fit: true,                 // <-- vis-network's own auto-fit after settle
+        fit: false,                // we do a one-shot fit in the stabilized handler
       },
     },
     interaction: {
       hover: true,
       hoverConnectedEdges: true,
-      zoomView: true,
-      dragView: true,
+      zoomView: true,         // scroll-wheel zoom
+      dragView: true,         // drag empty space to pan
+      dragNodes: true,        // drag a node to reposition it
       tooltipDelay: 250,
       multiselect: false,
+      navigationButtons: false,
+      keyboard: false,
     },
     layout: {
       improvedLayout: true,
@@ -230,12 +239,18 @@ export function ensureMounted(container, onNodeClick) {
 
   network = new window.vis.Network(container, { nodes: nodesDS, edges: edgesDS }, options);
 
-  // Click → drawer
+  // Click on a node → BOTH open drawer AND auto-expand its 1-hop
+  // neighbourhood (silent, idempotent). Matches the seed-add UX where
+  // a freshly seeded node arrives with its connections already drawn.
   network.on("click", (params) => {
-    if (params.nodes && params.nodes[0] && onClickCb) onClickCb(params.nodes[0]);
+    const id = params.nodes && params.nodes[0];
+    if (!id) return;
+    if (onClickCb) onClickCb(id);
+    expandNode(id, /*silent=*/true);
   });
 
-  // Double-click → expand neighbourhood
+  // Double-click → explicit re-expand (no-op if already expanded; useful
+  // to force a refit after the layout settled or after pruning).
   network.on("doubleClick", async (params) => {
     if (params.nodes && params.nodes[0]) {
       await expandNode(params.nodes[0]);
@@ -263,9 +278,17 @@ export function ensureMounted(container, onNodeClick) {
     edgesDS.update(updates);
   });
 
-  // Once the layout settles, fit explicitly (belt-and-braces; physics.stabilization.fit=true also does it).
+  // Once the layout settles, fit ONCE (first stabilization only) and turn off
+  // physics permanently. New nodes added via expandNode() get deterministic
+  // ring positions — physics never wakes up again, so the camera stays put and
+  // the graph never drifts under the user's mouse.
+  let firstStabilizedDone = false;
   network.on("stabilized", () => {
-    network.fit({ animation: { duration: 250, easingFunction: "easeInOutQuad" } });
+    if (!firstStabilizedDone) {
+      network.fit({ animation: { duration: 250, easingFunction: "easeInOutQuad" } });
+      firstStabilizedDone = true;
+    }
+    network.setOptions({ physics: { enabled: false } });
   });
 
   // Hidden-container handling: if the canvas wasn't visible at mount, fit
@@ -320,6 +343,20 @@ export function clear() {
 
 export function fit() {
   if (network) network.fit({ animation: { duration: 250 } });
+}
+
+export function zoomIn() {
+  if (!network) return;
+  network.moveTo({ scale: network.getScale() * 1.3, animation: { duration: 200 } });
+}
+
+export function zoomOut() {
+  if (!network) return;
+  network.moveTo({ scale: network.getScale() * 0.7, animation: { duration: 200 } });
+}
+
+export async function expand(id) {
+  return expandNode(id);
 }
 
 export function reset() {
@@ -384,15 +421,39 @@ async function expandNode(entityId, silent = false) {
     }
     ids.delete(entityId);
     const missing = [...ids].filter(id => !nodesDS.get(id));
+
     if (nodesDS.length + missing.length > HARD_CAP) {
       if (!silent) flashToast(`Graph capped at ${HARD_CAP} nodes; prune before expanding more.`);
-    } else {
+    } else if (missing.length > 0) {
+      // Where are we expanding FROM? Use the seed node's current canvas
+      // position so new nodes appear in a ring AROUND it, not at (0,0).
+      const positions = network.getPositions([entityId]);
+      const center = positions[entityId] || { x: 0, y: 0 };
+      const radius = 180 + Math.random() * 40;     // 180-220 px ring
+
       const fetched = await Promise.all(missing.map(async id => {
         try { return await apiGet(`/entities/${id}`); } catch { return null; }
       }));
-      for (const e of fetched) if (e) addOrUpdateNode(e);
+      const valid = fetched.filter(Boolean);
+      const angleStep = valid.length > 0 ? (2 * Math.PI) / valid.length : 0;
+      // Random rotation so successive expansions don't all start at angle 0.
+      const angleOffset = Math.random() * Math.PI * 2;
+
+      valid.forEach((e, i) => {
+        const cfg = nodeConfig(e);
+        if (nodesDS.length >= HARD_CAP) return;
+        if (nodesDS.get(cfg.id)) { nodesDS.update(cfg); return; }
+        const angle = angleOffset + i * angleStep + (Math.random() - 0.5) * 0.4;
+        cfg.x = center.x + radius * Math.cos(angle);
+        cfg.y = center.y + radius * Math.sin(angle);
+        nodesDS.add(cfg);
+      });
     }
-    for (const r of relations) addOrUpdateEdge(r);
+    for (const r of relations) {
+      addOrUpdateEdge(r);
+    }
+    // No physics re-enable: new nodes have deterministic positions and the
+    // existing nodes don't move. Camera stays put, pan stays smooth.
   } catch (e) {
     console.error(`expandNode(${entityId}) failed:`, e);
     if (!silent) flashToast(`Expand failed: ${e.message}`);
