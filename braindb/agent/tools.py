@@ -636,10 +636,13 @@ async def delete_relation(relation_id: str) -> str:
 @function_tool
 @_verbose("view_tree")
 async def view_tree(entity_id: str, max_depth: int = 2) -> str:
-    """⭐ Reveals an entity's connections in one call: relations + 1-N hop
-    neighbours + edge scores. Especially useful when you have an entity ID
-    (from a previous result) and want its graph context — often a sharper
-    choice than another `recall_memory` about the same entity.
+    """⭐ Reveals an entity's neighbourhood as a nested JSON tree:
+    root keyed by ``entity_type``, ``children`` arrays per node, multi-path
+    first-wins, keyword/retired-wiki noise filtered, ``_truncated`` marker
+    when more remain. Especially useful when you have an entity ID (from a
+    previous result) and want its graph context — often a sharper choice
+    than another `recall_memory` about the same entity. Pass `max_depth=3`
+    on hub entities (wikis with many connections) to see narrative chains.
 
     Args:
         entity_id: UUID of the root entity.
@@ -650,43 +653,12 @@ async def view_tree(entity_id: str, max_depth: int = 2) -> str:
     try:
         from braindb.services.tree import build_entity_tree
         with get_conn() as conn:
-            tree = build_entity_tree(conn, entity_id, max_depth)
+            tree = build_entity_tree(conn, entity_id, max_depth=max_depth)
         if tree is None:
             return _err(f"Entity not found: {entity_id}")
-        root = tree["root"]
-        conns = tree["connections"]
-        out = [f"ROOT [{root['entity_type']}] {_tree_label(root)} (id: {root['id']})"]
-        if not conns:
-            out.append("\n(no connections)")
-            return _truncate("\n".join(out))
-        # Group output by depth
-        last_depth = None
-        for c in conns:
-            d = c["depth"]
-            if d != last_depth:
-                same_n = sum(1 for x in conns if x["depth"] == d)
-                out.append(f"\nDEPTH {d} ({same_n}):")
-                last_depth = d
-            ent = c["entity"]
-            dir_short = "out" if c.get("direction") == "outgoing" else "in"
-            out.append(
-                f"  [{dir_short}] {c['via_relation_type']} (rel={c['relevance']})\n"
-                f"    [{ent['entity_type']}] {_tree_label(ent)} (id: {ent['id']})"
-            )
-        return _truncate("\n".join(out))
+        return _truncate(json.dumps(tree, indent=2, default=str, ensure_ascii=False))
     except Exception as e:
         return _err(str(e))
-
-
-def _tree_label(entity: dict) -> str:
-    """Short label for tree output. Wikis use canonical_name; others truncate content."""
-    import re as _r
-    content = (entity.get('content') or '').replace('\n', ' ')
-    if entity.get('entity_type') == 'wiki':
-        m = _r.search(r'canonical_name=([^\s]+)', content)
-        if m:
-            return m.group(1)
-    return content[:80]
 
 
 @function_tool

@@ -79,15 +79,33 @@ def get_rules():
 
 
 @router.get("/tree/{entity_id}")
-def entity_tree(entity_id: UUID, max_depth: int = Query(default=2, ge=1, le=3)):
-    """Return an entity and its graph connections organized by depth.
+def entity_tree(
+    entity_id: UUID,
+    max_depth: int = Query(default=2, ge=1, le=3),
+    include_keywords: bool = Query(default=False),
+    top_k: int = Query(default=40, ge=1, le=500),
+    min_path_score: float = Query(default=0.0, ge=0.0, le=1.0),
+):
+    """Return an entity and its graph neighbourhood as a nested JSON tree.
 
-    Uses the shared `build_entity_tree` service (also used by the agent's
-    `view_tree` tool) so HTTP callers and the agent see the same data.
+    Round-2f shape: root keyed by ``entity_type``; ``children`` array of
+    typed nodes (each keyed by its own ``entity_type`` and labelled to
+    its type — wiki=title, fact/thought=content, source=filename, etc.);
+    multi-path first-wins by accumulated path score; ``tagged_with``
+    keyword edges skipped by default (root's ``keywords`` array is the
+    one-liner instead). Top-``top_k`` connections are kept; the rest are
+    summarised with a single ``_truncated`` marker.
     """
     from braindb.services.tree import build_entity_tree
     with get_conn() as conn:
-        tree = build_entity_tree(conn, str(entity_id), max_depth)
+        tree = build_entity_tree(
+            conn,
+            str(entity_id),
+            max_depth=max_depth,
+            include_keywords=include_keywords,
+            top_k=top_k,
+            min_path_score=min_path_score,
+        )
     if tree is None:
         raise HTTPException(404, "Entity not found")
     return tree

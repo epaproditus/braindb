@@ -55,10 +55,12 @@ fall back to flat SQL.
    graph traversal + decay + ranking. Use first when you don't yet know which
    specific entity you want — "what do we know about X."
 2. **`view_tree(<id>, max_depth=N)`** — the efficient "explore around this
-   entity" tool. One call returns the entity's neighbours grouped by
-   relation type, plus their edge scores, 1-N hops out. When you have an
-   entity ID and want to know what's related to it, this is usually a
-   better next step than another `recall_memory` about the same entity.
+   entity" tool. Returns a nested JSON tree: root keyed by entity_type,
+   `children` arrays per node, 1-N hops out, keyword/retired-wiki noise
+   filtered, `_truncated` marker if more remain. When you have an entity
+   ID and want what's connected, this is usually a better next step than
+   another `recall_memory`. On hub entities (wikis), pass `max_depth=3`
+   to see narrative chains.
 3. **`delegate_to_subagent`** — for any multi-step investigation or
    disambiguation ("is this the same person/thing?", "find and resolve X").
    A fresh agent with the full toolset; returns a summary. Prefer this over
