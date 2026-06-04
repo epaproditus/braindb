@@ -47,10 +47,28 @@ def _entity_count(conn) -> int:
     return int(row[0]) if row else 0
 
 
-def _seconds_since_last_entity(conn) -> float | None:
+def _seconds_since_last_activity(conn) -> float | None:
+    """Seconds since the last INSERT in EITHER the entities OR the relations
+    table. Tracking both is necessary because the per-chunk extraction agent
+    (after the big-chunks change) does its save_fact() bursts up front, then
+    spends 2-4 minutes calling create_relation() for cross-fact edges and
+    optionally delegate_to_subagent() / recall_memory(). During that tail
+    the entities table is quiet but the agent IS still working. If warmup
+    only watched entities, it would falsely declare "extraction done" while
+    chunk 1's agent is still doing its relation work and chunks 2..N have
+    not started.
+
+    GREATEST in Postgres ignores NULL arguments, so an empty relations
+    table (early in the run) falls back gracefully to the entities max.
+    Both NULL (truly empty DB) → returns NULL → caller treats as "no data
+    yet".
+    """
     row = _query_one(
         conn,
-        "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(created_at))) FROM entities",
+        """SELECT EXTRACT(EPOCH FROM (NOW() - GREATEST(
+            (SELECT MAX(created_at) FROM entities),
+            (SELECT MAX(created_at) FROM relations)
+        )))""",
     )
     return float(row[0]) if row and row[0] is not None else None
 
@@ -71,7 +89,7 @@ def _unprocessed_files() -> list[Path]:
 
 def wait_for_warmup(
     *,
-    settle_seconds: float = 180.0,
+    settle_seconds: float = 300.0,
     consecutive_clear_required: int = 2,
     poll_interval: float = 5.0,
     timeout_seconds: float = 1800.0,
@@ -112,25 +130,26 @@ def wait_for_warmup(
     try:
         while time.monotonic() < deadline:
             files_remaining = len(_unprocessed_files())
-            entity_age = _seconds_since_last_entity(conn)
+            activity_age = _seconds_since_last_activity(conn)
             pending = _pending_wiki_jobs(conn)
             entity_count = _entity_count(conn)
 
-            if entity_age is None:
-                # No entities yet. If files are still in sources/, watcher
-                # hasn't started; if not, it may have just finished — give
-                # it a tiny grace period before declaring "no work to do".
+            if activity_age is None:
+                # No entities or relations yet. If files are still in
+                # sources/, watcher hasn't started; if not, it may have
+                # just finished — give it a tiny grace period before
+                # declaring "no work to do".
                 clear = files_remaining == 0 and (time.monotonic() - start) > 10
             else:
                 clear = (
                     files_remaining == 0
-                    and entity_age >= settle_seconds
+                    and activity_age >= settle_seconds
                     and (not block_on_wiki_queue or pending == 0)
                 )
 
             elapsed = time.monotonic() - start
             if verbose and (elapsed - last_log >= log_interval):
-                age_str = f"{entity_age:.0f}s" if entity_age is not None else "n/a"
+                age_str = f"{activity_age:.0f}s" if activity_age is not None else "n/a"
                 print(
                     f"[warmup t={elapsed:6.0f}s] files_left={files_remaining} "
                     f"entities={entity_count} last_entity_age={age_str} "
@@ -152,7 +171,7 @@ def wait_for_warmup(
         raise TimeoutError(
             f"warmup did not converge within {timeout_seconds:.0f}s "
             f"(files_left={len(_unprocessed_files())}, "
-            f"last_entity_age={_seconds_since_last_entity(conn)}, "
+            f"last_activity_age={_seconds_since_last_activity(conn)}, "
             f"pending_wiki={_pending_wiki_jobs(conn)})"
         )
     finally:
@@ -176,10 +195,12 @@ def _final_stats(conn, start: float) -> dict:
 def _cli() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--timeout", type=float, default=1800)
-    p.add_argument("--settle-seconds", type=float, default=180,
-                   help="seconds of no INSERT on entities before declaring extraction settled "
-                        "(default 180; large enough to span the gap between datasource creation "
-                        "and first extracted fact for big documents)")
+    p.add_argument("--settle-seconds", type=float, default=300,
+                   help="seconds of no INSERT on entities OR relations before declaring "
+                        "extraction settled (default 300). Per-chunk extraction agents do "
+                        "save_fact bursts up front, then 2-4 minutes of create_relation + "
+                        "subagent / recall_memory work; tracking both tables prevents the "
+                        "barrier from falsely converging during a chunk's relation tail.")
     p.add_argument("--poll-interval", type=float, default=5)
     p.add_argument("--consecutive-clear", type=int, default=2)
     p.add_argument("--quiet", action="store_true")
