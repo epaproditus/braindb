@@ -174,31 +174,86 @@ def create_conv_db(conv_id: int) -> str:
 
 
 def restart_api_with_db(database_url: str) -> None:
-    """Force-recreate the api_bench container with BENCH_DATABASE_URL set
-    to the given URL. The container's startup runs alembic migrations on
-    the new (empty) DB, then starts uvicorn.
+    """Recreate the api_bench container with DATABASE_URL set to ``database_url``.
 
-    Uses `docker compose up -d --force-recreate api_bench` from inside the
-    bench_runner container (which has the docker CLI + socket mounted).
+    We use the Docker Python SDK rather than ``docker compose`` because bench.py
+    runs inside the bench_runner container. ``docker compose -f .../docker-compose.bench.yml
+    up`` would resolve the compose file's relative paths (e.g. ``.:/app``) against
+    the runner's view of the filesystem, not the host's. The recreated api_bench
+    would then bind-mount the runner's /app (which is the workstation host dir,
+    but only because of OUR bind mount — fragile and wrong from the daemon's POV).
+
+    The SDK path captures the existing api_bench container's config (image,
+    binds, networks, ports, etc.) and recreates it with that config plus the
+    updated ``DATABASE_URL`` env var.
     """
     assert_bench_database_url(database_url)
-    env = os.environ.copy()
-    env["BENCH_DATABASE_URL"] = database_url
-    result = subprocess.run(
-        [
-            "docker", "compose",
-            "-f", _COMPOSE_FILE,
-            "up", "-d", "--force-recreate", "--no-deps", "api_bench",
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
+    import docker as docker_sdk  # imported lazily so the module loads on hosts
+                                  # that don't have the SDK installed
+    client = docker_sdk.from_env()
+    try:
+        existing = client.containers.get("braindb_bench_api")
+    except docker_sdk.errors.NotFound:  # type: ignore[attr-defined]
         raise RuntimeError(
-            f"docker compose up -d --force-recreate api_bench failed:\n"
-            f"  stdout: {result.stdout[:500]}\n  stderr: {result.stderr[:500]}"
+            "braindb_bench_api container not found — bring the compose stack "
+            "up first: `docker compose -f docker-compose.bench.yml up -d`"
         )
+
+    cfg = existing.attrs
+    image = cfg["Config"]["Image"]
+    host_cfg = cfg["HostConfig"]
+    net_settings = cfg["NetworkSettings"]
+
+    # Preserve existing volumes (host paths the daemon already resolved when
+    # the container was first created via `docker compose up`).
+    binds = list(host_cfg.get("Binds") or [])
+
+    # Networks: rejoin all networks the container was on. Use the first as the
+    # primary `network=` arg, then attach the rest after start.
+    networks = list((net_settings.get("Networks") or {}).keys())
+
+    # Ports: preserve the existing host port mapping.
+    port_bindings = {}
+    for port_proto, mappings in (host_cfg.get("PortBindings") or {}).items():
+        if mappings:
+            port_bindings[port_proto] = mappings[0]["HostPort"]
+
+    # Env: replace DATABASE_URL (or add if missing).
+    env_list = list(cfg["Config"].get("Env") or [])
+    new_env = [e for e in env_list if not e.startswith("DATABASE_URL=")]
+    new_env.append(f"DATABASE_URL={database_url}")
+
+    # Stop + remove existing.
+    existing.stop(timeout=30)
+    existing.remove()
+
+    # Recreate with same shape + new env.
+    container = client.containers.run(
+        image,
+        name="braindb_bench_api",
+        detach=True,
+        environment=new_env,
+        volumes=binds,
+        ports=port_bindings,
+        network=networks[0] if networks else None,
+        extra_hosts={
+            h.split(":", 1)[0]: h.split(":", 1)[1]
+            for h in (host_cfg.get("ExtraHosts") or [])
+        } or None,
+        restart_policy=(
+            {"Name": host_cfg["RestartPolicy"]["Name"]}
+            if host_cfg.get("RestartPolicy") and host_cfg["RestartPolicy"].get("Name")
+            else None
+        ),
+        command=cfg["Config"].get("Cmd"),
+        working_dir=cfg["Config"].get("WorkingDir") or None,
+    )
+    # Attach to additional networks (run() only takes one).
+    for net_name in networks[1:]:
+        try:
+            client.networks.get(net_name).connect(container)
+        except docker_sdk.errors.NotFound:  # type: ignore[attr-defined]
+            pass
 
 
 def wait_for_api_healthy(timeout: float = 180, poll: float = 2) -> None:
