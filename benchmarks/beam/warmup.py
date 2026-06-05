@@ -89,7 +89,7 @@ def _unprocessed_files() -> list[Path]:
 
 def wait_for_warmup(
     *,
-    settle_seconds: float = 300.0,
+    settle_seconds: float = 600.0,
     consecutive_clear_required: int = 2,
     poll_interval: float = 5.0,
     timeout_seconds: float = 1800.0,
@@ -195,12 +195,14 @@ def _final_stats(conn, start: float) -> dict:
 def _cli() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--timeout", type=float, default=1800)
-    p.add_argument("--settle-seconds", type=float, default=300,
+    p.add_argument("--settle-seconds", type=float, default=600,
                    help="seconds of no INSERT on entities OR relations before declaring "
-                        "extraction settled (default 300). Per-chunk extraction agents do "
+                        "extraction settled (default 600). Per-chunk extraction agents do "
                         "save_fact bursts up front, then 2-4 minutes of create_relation + "
                         "subagent / recall_memory work; tracking both tables prevents the "
-                        "barrier from falsely converging during a chunk's relation tail.")
+                        "barrier from falsely converging during a chunk's relation tail. "
+                        "10 min gives comfortable slack over the worst observed quiet "
+                        "stretch (~3 min) plus chunk-transition gaps.")
     p.add_argument("--poll-interval", type=float, default=5)
     p.add_argument("--consecutive-clear", type=int, default=2)
     p.add_argument("--quiet", action="store_true")

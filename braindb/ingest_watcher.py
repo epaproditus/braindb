@@ -50,7 +50,7 @@ CHUNK_WORDS = 1200          # target chunk size (~7-8k char prompt, ~1.5K tokens
 CHUNK_OVERLAP = 75          # words of overlap between adjacent chunks — catches facts that span a boundary
 
 INGEST_TIMEOUT = 60
-AGENT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "1200"))   # env-overridable; matches wiki_scheduler pattern. Generous default for slow / deep-exploring LLM runs.
+AGENT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "1800"))   # env-overridable; matches wiki_scheduler pattern. 30-min single-attempt cap leaves plenty of headroom for big-chunk runs where the cross-fact-relation tail extends past the ~6-min average.
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 logging.basicConfig(
@@ -186,12 +186,29 @@ def extract_facts_from_chunk(ds_id: str, title: str, idx: int, total: int, chunk
         f'  "Saved N facts from chunk {idx}/{total}: <fact_id_1>, <fact_id_2>, ..."\n\n'
         f"<content>\n{chunk_text}\n</content>"
     )
-    answer = call_agent(prompt, max_turns=35)
-    if not answer:
-        return []
-    fact_ids = UUID_RE.findall(answer)
-    # Filter out the datasource id if the model happened to echo it
-    return [fid for fid in fact_ids if fid != ds_id]
+    # 3-attempt retry around the per-chunk call. Retry ONLY when answer is None
+    # (HTTP error, timeout, connection failure) OR the parse produced zero fact
+    # UUIDs (agent never reached final_answer). If the first attempt DID save
+    # facts (parsed UUIDs in the answer string), do not retry — the facts are
+    # already committed via tool calls, and a retry would dupe them.
+    for attempt in range(1, 4):
+        answer = call_agent(prompt, max_turns=40)
+        if answer:
+            fact_ids = UUID_RE.findall(answer)
+            real_ids = [fid for fid in fact_ids if fid != ds_id]
+            if real_ids:
+                if attempt > 1:
+                    log.info("chunk %d/%d succeeded on attempt %d/3", idx, total, attempt)
+                return real_ids
+        if attempt < 3:
+            backoff = 5 * attempt   # 5s, then 10s
+            log.warning(
+                "chunk %d/%d attempt %d/3 produced no facts; retrying in %ds",
+                idx, total, attempt, backoff,
+            )
+            time.sleep(backoff)
+    log.warning("chunk %d/%d FAILED after 3 attempts", idx, total)
+    return []
 
 
 def central_review(ds_id: str, title: str, fact_ids: list[str]) -> None:

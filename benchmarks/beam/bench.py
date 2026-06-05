@@ -273,12 +273,14 @@ def restart_api_with_db(database_url: str) -> None:
     container.start()
 
 
-def wait_for_api_healthy(timeout: float = 180, poll: float = 2) -> None:
+def wait_for_api_healthy(timeout: float = 300, poll: float = 2) -> None:
     """Block until the bench api responds with status=ok.
 
     The api needs to (1) connect to the new DB, (2) run alembic migrations,
     (3) load the embedding model into memory. On first start this is ~30-60s;
     on subsequent restarts (model already cached) it can still be ~20-30s.
+    Bumped 180s -> 300s for generous slack on cold-cache restarts and to
+    absorb an occasional slow alembic migration without tripping.
     """
     start = time.monotonic()
     last_err = None
@@ -333,22 +335,44 @@ def answer_one_question(
 ) -> tuple[str, dict]:
     """POST /agent/query with the question; return (answer_text, raw_payload).
 
-    Returns the answer text and the full payload (so we can capture tool
-    counts, latency, etc.) for the per-question record. Errors get caught
-    in the caller and recorded as `[ERROR: ...]` so the run continues.
+    Three-attempt retry with 5s/10s backoff. Retries on connection errors,
+    timeouts, and HTTP 5xx — these are the transient classes (API recycling,
+    LLM backend blip, vLLM batching pause). Does NOT retry on HTTP 4xx —
+    those are request-shape errors and will repeat. After 3 failed attempts
+    the last exception is raised so the caller records `[ERROR: ...]` and
+    the run continues to the next question.
     """
-    started = time.monotonic()
-    r = requests.post(
-        f"{base}/api/v1/agent/query",
-        json={"query": question_text},
-        timeout=timeout,
-    )
-    elapsed = time.monotonic() - started
-    r.raise_for_status()
-    payload = r.json()
-    payload["_elapsed_seconds"] = round(elapsed, 2)
-    # BrainDB's /agent/query response shape: {"answer": "..."} at minimum.
-    return payload.get("answer", ""), payload
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        started = time.monotonic()
+        try:
+            r = requests.post(
+                f"{base}/api/v1/agent/query",
+                json={"query": question_text},
+                timeout=timeout,
+            )
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_exc = e
+        else:
+            if 500 <= r.status_code < 600:
+                last_exc = requests.HTTPError(
+                    f"HTTP {r.status_code} on attempt {attempt}/3: {r.text[:200]}",
+                    response=r,
+                )
+            else:
+                r.raise_for_status()  # 4xx -> raise immediately, caller records
+                elapsed = time.monotonic() - started
+                payload = r.json()
+                payload["_elapsed_seconds"] = round(elapsed, 2)
+                if attempt > 1:
+                    payload["_attempts"] = attempt
+                # BrainDB's /agent/query response shape: {"answer": "..."} at minimum.
+                return payload.get("answer", ""), payload
+        # Got a transient error — back off and retry unless this was the last try
+        if attempt < 3:
+            time.sleep(5 * attempt)   # 5s, 10s
+    assert last_exc is not None
+    raise last_exc
 
 
 # ----------------------------- per-conv lifecycle ----------------------------
@@ -358,7 +382,7 @@ def run_one_conversation(
     run_dir: Path,
     *,
     warmup_timeout: float = 1800,
-    warmup_settle_seconds: float = 300,
+    warmup_settle_seconds: float = 600,
     question_timeout: float = QUESTION_TIMEOUT_SECONDS,
     block_on_wiki_queue: bool = False,
 ) -> dict:
@@ -517,11 +541,11 @@ def _parse_args() -> argparse.Namespace:
                    help="abort the whole run if any single conversation raises")
     p.add_argument("--warmup-timeout", type=float, default=1800,
                    help="seconds before warmup gives up on convergence")
-    p.add_argument("--warmup-settle-seconds", type=float, default=300,
+    p.add_argument("--warmup-settle-seconds", type=float, default=600,
                    help="seconds of quiet on entities AND relations before declaring "
-                        "warmup clear (default 300). Per-chunk agents have ~60-90s quiet "
+                        "warmup clear (default 600). Per-chunk agents have 2-4 min quiet "
                         "stretches doing subagent / recall_memory work between save_fact "
-                        "and create_relation bursts; 300s comfortably covers those.")
+                        "and create_relation bursts; 10 min gives generous slack.")
     p.add_argument("--wait-for-wikis", action="store_true",
                    help="Strict warmup mode: also wait for the wiki_job queue to be "
                         "fully drained before answering. Off by default because the "
