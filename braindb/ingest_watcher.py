@@ -159,7 +159,7 @@ def extract_facts_from_chunk(ds_id: str, title: str, idx: int, total: int, chunk
         f"Below is chunk {idx}/{total} of the document between <content> markers.\n"
         f"Extract the concrete, standalone FACTS from this chunk — specific claims,\n"
         f"numbers, events, named decisions. Ignore filler, opinion, and generic\n"
-        f"statements. Aim for quality over quantity: typically 5-10 facts per chunk.\n\n"
+        f"statements. Aim for quality over quantity: typically from 1-2 to 30 depending on density and length of the chunk.\n\n"
         f"For EACH fact:\n"
         f'  a) Call save_fact(content="<the fact in one sentence>",\n'
         f'     source="document", keywords=[2-4 precise tags],\n'
