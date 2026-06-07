@@ -139,6 +139,7 @@ decide from previews, then read only what you need:
   follow `content_meta.next_offset` until it is `null`. For big documents,
   prefer `POST /api/v1/agent/query` with "delegate to a subagent to read and
   distil entity <id>" so the heavy content never enters this conversation.
+- Fact `notes` may include a byte range like `(bytes 245760-252960)` — pass directly as `GET /api/v1/entities/{id}?offset=245760&limit=7200` to read the exact source slice the fact was extracted from.
 
 ## RECALL — Before Responding
 

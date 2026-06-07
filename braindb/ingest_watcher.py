@@ -113,27 +113,48 @@ def call_agent(prompt: str, max_turns: int = 8) -> str | None:
     return r.json().get("answer") or ""
 
 
-def split_chunks(text: str, chunk_words: int = CHUNK_WORDS, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split text into word-bounded chunks with configurable overlap.
+def split_chunks_with_offsets(
+    text: str, chunk_words: int = CHUNK_WORDS, overlap: int = CHUNK_OVERLAP,
+) -> list[tuple[str, int, int]]:
+    """Like :func:`split_chunks` but each entry is
+    ``(chunk_text, byte_start, byte_end)`` where ``byte_start``/``byte_end``
+    are positions in the ORIGINAL text (so ``text[byte_start:byte_end]``
+    recovers the original whitespace, not just the joined words).
 
-    Always splits at whitespace, never mid-word. Each chunk (after the first)
-    starts `overlap` words before the previous chunk's tail, so facts that
-    straddle a boundary are still visible in at least one chunk.
+    Used at extraction time so the recall-side agent can locate the exact
+    source slice for a fact via ``get_entity(id, offset=byte_start,
+    limit=byte_end - byte_start)`` instead of guessing byte offsets from
+    a word-based chunk number.
     """
-    words = text.split()
-    if not words:
+    word_positions = [(m.group(), m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+    if not word_positions:
         return []
     if overlap >= chunk_words:
         overlap = 0  # nonsensical config, fall back to no overlap
     step = chunk_words - overlap
-    chunks: list[str] = []
+    result: list[tuple[str, int, int]] = []
     i = 0
-    while i < len(words):
-        chunks.append(" ".join(words[i:i + chunk_words]))
-        if i + chunk_words >= len(words):
+    while i < len(word_positions):
+        end = min(i + chunk_words, len(word_positions))
+        slice_ = word_positions[i:end]
+        result.append((
+            " ".join(w[0] for w in slice_),
+            slice_[0][1],
+            slice_[-1][2],
+        ))
+        if end == len(word_positions):
             break
         i += step
-    return chunks
+    return result
+
+
+def split_chunks(text: str, chunk_words: int = CHUNK_WORDS, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """List of chunk strings. Thin back-compat wrapper around
+    :func:`split_chunks_with_offsets` — keeps the existing API stable for
+    callers that don't need byte offsets, and ensures the chunking logic
+    has a single source of truth.
+    """
+    return [t for (t, _, _) in split_chunks_with_offsets(text, chunk_words, overlap)]
 
 
 def fetch_entity(entity_id: str) -> dict | None:
@@ -146,10 +167,19 @@ def fetch_entity(entity_id: str) -> dict | None:
     return None
 
 
-def extract_facts_from_chunk(ds_id: str, title: str, idx: int, total: int, chunk_text: str) -> list[str]:
+def extract_facts_from_chunk(
+    ds_id: str, title: str, idx: int, total: int, chunk_text: str,
+    byte_start: int, byte_end: int,
+) -> list[str]:
     """Ask one agent call to extract facts from a chunk, save each via save_fact,
     and link each back to the datasource via create_relation(derived_from).
     Returns the list of new fact IDs parsed from the agent's final_answer answer.
+
+    ``byte_start``/``byte_end`` are the chunk's offset/length in the original
+    datasource text; they are baked into each saved fact's ``notes`` field so
+    a downstream recall agent can read the exact source slice via
+    ``get_entity(id, offset=byte_start, limit=byte_end-byte_start)`` instead
+    of guessing the location from the chunk number.
     """
     prompt = (
         f"A document was just ingested into BrainDB.\n"
@@ -163,7 +193,8 @@ def extract_facts_from_chunk(ds_id: str, title: str, idx: int, total: int, chunk
         f"For EACH fact:\n"
         f'  a) Call save_fact(content="<the fact in one sentence>",\n'
         f'     source="document", keywords=[2-4 precise tags],\n'
-        f'     notes="Extracted from {title} chunk {idx}/{total}"). Judge\n'
+        f'     notes="Extracted from {title} chunk {idx}/{total} '
+        f'(bytes {byte_start}-{byte_end})"). Judge\n'
         f"     certainty and importance per the tool's docstring guidance.\n"
         f"     Record the returned fact id.\n"
         f"  b) Call create_relation(from_entity_id=<fact_id>, "
@@ -269,16 +300,18 @@ def enrich_datasource(ds: dict, file_path: Path) -> None:
         log.warning("enrichment read failed for %s: %s", ds_id[:8], e)
         return
 
-    chunks = split_chunks(text)
+    chunks = split_chunks_with_offsets(text)
     if not chunks:
         log.info("enrichment skipped for %s: empty content", ds_id[:8])
         return
     log.info("extraction started for %s: %d chunks", ds_id[:8], len(chunks))
 
     all_fact_ids: list[str] = []
-    for i, chunk in enumerate(chunks, start=1):
+    for i, (chunk, b_start, b_end) in enumerate(chunks, start=1):
         log.info("extracting facts chunk %d/%d for %s", i, len(chunks), ds_id[:8])
-        fact_ids = extract_facts_from_chunk(ds_id, title, i, len(chunks), chunk)
+        fact_ids = extract_facts_from_chunk(
+            ds_id, title, i, len(chunks), chunk, b_start, b_end,
+        )
         if fact_ids:
             log.info("chunk %d/%d saved %d facts", i, len(chunks), len(fact_ids))
             all_fact_ids.extend(fact_ids)
