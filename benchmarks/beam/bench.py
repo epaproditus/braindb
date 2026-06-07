@@ -385,6 +385,7 @@ def run_one_conversation(
     warmup_settle_seconds: float = 600,
     question_timeout: float = QUESTION_TIMEOUT_SECONDS,
     block_on_wiki_queue: bool = False,
+    wiki_wait_seconds: float = 0,
 ) -> dict:
     """Full A-B-C-D lifecycle for one conversation. Returns a small stats dict."""
     conv_dir = run_dir / f"conv_{int(conv.conversation_id):03d}"
@@ -419,6 +420,18 @@ def run_one_conversation(
         database_url=conv_db_url,
     )
     print(f"[B done] {warmup_stats}", flush=True)
+
+    # ---- Phase Bw (optional): wait for wiki writer to drain its queue ----
+    # Between [B done] (extraction settled) and [C] (questions start), give
+    # the wiki writer/maintainer dedicated vLLM time so wikis develop before
+    # recall queries hit. Skipped when wiki_wait_seconds == 0 (default).
+    if wiki_wait_seconds and wiki_wait_seconds > 0:
+        print(
+            f"[Bw] waiting {wiki_wait_seconds:.0f}s for wiki queue to develop ...",
+            flush=True,
+        )
+        time.sleep(wiki_wait_seconds)
+        print(f"[Bw done]", flush=True)
 
     # ---- Phase C: answer all questions ----
     probing = load_probing_questions(conv)
@@ -558,6 +571,14 @@ def _parse_args() -> argparse.Namespace:
                         "continue async in the background regardless.")
     p.add_argument("--question-timeout", type=float, default=QUESTION_TIMEOUT_SECONDS,
                    help="per-question HTTP timeout on /agent/query")
+    p.add_argument("--wiki-wait-seconds", type=float, default=0,
+                   help="seconds to wait after [B done] before starting Phase C, "
+                        "so the wiki writer can drain its queue against an "
+                        "otherwise-idle vLLM (default 0 = no wait). Recommended "
+                        "value 28800 (8 hours) for BEAM 100K convs — captures most "
+                        "of the queue-drain benefit; longer waits hit diminishing "
+                        "returns because the maintainer keeps queuing new triage "
+                        "jobs at roughly the rate the writer drains them.")
     return p.parse_args()
 
 
@@ -595,6 +616,7 @@ def main() -> int:
                 warmup_settle_seconds=args.warmup_settle_seconds,
                 question_timeout=args.question_timeout,
                 block_on_wiki_queue=args.wait_for_wikis,
+                wiki_wait_seconds=args.wiki_wait_seconds,
             )
             metas.append(meta)
         except Exception as e:
