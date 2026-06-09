@@ -4,9 +4,10 @@ Public benchmark harness running BrainDB against the **BEAM** memory benchmark
 ([arXiv:2510.27246](https://arxiv.org/abs/2510.27246), ICLR 2026, Tavakoli et al.
 of U Alberta + UMass Amherst).
 
-**Status**: Step 0 scaffolding (this file, the bench compose, the upstream
-submodule). Phase 1 harness code (`adapter.py`, `bench.py`, `judge.py`,
-`score.py`, `warmup.py`) is being implemented in the same commit series.
+**Status**: harness shipped. Dataset adapter, per-conversation runner,
+warmup barrier, Qwen-as-judge, scoring, and the isolated bench stack
+(`docker-compose.bench.yml`) are all in this directory. See
+`adapter.py`, `bench.py`, `judge.py`, `score.py`, `warmup.py`.
 
 ---
 
@@ -22,7 +23,7 @@ Nothing in our code paraphrases, copies, or reinterprets the benchmark.
 | Judge prompt | `from src.prompts import unified_llm_judge_base_prompt` — loaded at runtime from the submodule | Zero prompt content in our codebase; no risk of paraphrase or typo |
 | Adapter (dataset → BrainDB ingest) | `adapter.py` (ours, ~150 LOC) | Transparent: read the code |
 | Bench runner (per-conversation reset + ingest + warmup + answer) | `bench.py` (ours, ~120 LOC) | Same |
-| Judge runner (calls Qwen with the upstream prompt) | `judge.py` (ours, ~80 LOC) | Anyone can re-judge our `answers.json` with any model |
+| Judge runner (calls the configured LLM with the upstream prompt) | `judge.py` (ours, ~80 LOC) | Anyone can re-judge our `answers.json` with any model |
 | Eval wrapper (invokes upstream eval) | `score.py` (ours, ~50 LOC) | Just a thin caller |
 
 **The "no copy" rule** is satisfied at the strongest level: the judge prompt
@@ -68,10 +69,13 @@ One-command restore if anything ever goes wrong.
 
 ## Caveats on the published number
 
-We use **Qwen 3.6-27B** (local, via the workstation vLLM tunnel) as the LLM
-judge. Published BEAM scores used GPT-4o (mem0) or Gemini-2.5-flash-lite
-(Hindsight). **Our Qwen-judged number is NOT directly comparable to those
-published numbers** — judge models systematically differ.
+The judge is an OpenAI-compatible LLM endpoint. The repo default is
+**deepinfra** (`google/gemma-4-31B-it`); self-hosted Qwen 3.6-27B via a
+local vLLM endpoint is supported via `.env.bench` overrides
+(see `.env.bench.example`). Published BEAM scores used GPT-4o (mem0)
+or Gemini-2.5-flash-lite (Hindsight); **our judge will systematically
+differ from theirs**, so the headline is not directly comparable to those
+published numbers without a calibration sample.
 
 The mitigations:
 
