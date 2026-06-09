@@ -29,11 +29,12 @@ DRAIN_MAX = int(os.getenv("WIKI_DRAIN_MAX", "20"))        # safety bound on /wri
 # `maintain` runs concurrently alongside writers (1 maintain in flight, C1).
 WRITE_PARALLELISM = int(os.getenv("WIKI_WRITE_PARALLELISM", "3"))
 
-# Master on/off for the whole wiki pipeline. Default OFF so bringing the
-# stack up never auto-starts token-heavy work. Opt in explicitly with
-# WIKI_ENABLED=true (or 1/yes/on). Model-agnostic; orthogonal to any LLM
+# Master on/off for the whole wiki pipeline. Default ON — the wiki pipeline
+# is part of what makes BrainDB a knowledge layer (vs. just a fact store),
+# so a fresh stack starts the maintainer + writer automatically. Opt out
+# explicitly with WIKI_ENABLED=false. Model-agnostic; orthogonal to any LLM
 # profile/provider.
-WIKI_ENABLED = os.getenv("WIKI_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+WIKI_ENABLED = os.getenv("WIKI_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 # HTTP read-timeout (seconds) the scheduler waits on a single /wiki/maintain
 # or /wiki/write call before its requests client gives up and moves on.
 # Bumped 600 → 1200 (10 → 20 min) after live observation on Qwen 27B AWQ-INT4

@@ -69,7 +69,7 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       # Bench defaults to local Qwen via the workstation tunnel — matches the
       # plan's Qwen-as-judge story. Override via .env.bench if needed.
-      LLM_PROFILE: ${LLM_PROFILE_BENCH:-vllm_workstation_qwen}
+      LLM_PROFILE: ${LLM_PROFILE_BENCH:-deepinfra}
       AGENT_MODEL: ${AGENT_MODEL:-}
       NVIDIA_NIM_API_KEY: ${NVIDIA_NIM_API_KEY:-}
       DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:-}
@@ -169,9 +169,13 @@ services:
       BENCH_ADMIN_DATABASE_URL: postgresql://braindb_bench:bench_local_only@postgres_bench:5432/postgres
       # bench.py mints per-conv URLs by appending `/braindb_conv_NNN` to this.
       BENCH_DB_BASE_URL: postgresql://braindb_bench:bench_local_only@postgres_bench:5432
-      # Workstation Qwen via Docker host gateway.
-      QWEN_BASE_URL: ${QWEN_BASE_URL_BENCH:-http://host.docker.internal:8010/v1}
-      QWEN_API_KEY: ${VLLM_API_KEY:-EMPTY}
+      # Judge LLM (OpenAI-compatible endpoint). Empty default — Python config
+      # in benchmarks/beam/config.py supplies the real default (deepinfra).
+      # Set QWEN_BASE_URL_BENCH / QWEN_MODEL_BENCH in .env.bench to point at
+      # a self-hosted vLLM endpoint (e.g. workstation Qwen on port 8010).
+      QWEN_BASE_URL: ${QWEN_BASE_URL_BENCH:-}
+      QWEN_MODEL: ${QWEN_MODEL_BENCH:-}
+      QWEN_API_KEY: ${QWEN_API_KEY:-${VLLM_API_KEY:-}}
       HF_TOKEN: ${HF_TOKEN:-}
       # Docker CLI invocations need to know which compose file + project.
       COMPOSE_FILE: /app/docker-compose.bench.yml

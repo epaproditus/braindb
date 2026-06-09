@@ -49,11 +49,18 @@ BENCH_DB_SENTINEL = BENCH_DB_SENTINELS[0]
 BENCH_API_BASE = os.getenv("BENCH_API_BASE", "http://localhost:8001")
 
 # ---- Judge LLM (OpenAI-compatible endpoint) ---------------------------------
-# Bench defaults to the workstation Qwen via vLLM on the SSH tunnel. The judge
-# is fully outside BrainDB; the bench API is independent of which judge runs.
-QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:8010/v1")
-QWEN_MODEL = os.getenv("QWEN_MODEL", "")  # empty -> let vLLM's served model resolve
-QWEN_API_KEY = os.getenv("QWEN_API_KEY", "EMPTY")  # vLLM defaults to no auth
+# Defaults target deepinfra so a fresh clone runs end-to-end with just an API key.
+# For self-hosted Qwen via vLLM, set in .env.bench:
+#   QWEN_BASE_URL_BENCH=http://host.docker.internal:8010/v1
+#   QWEN_MODEL_BENCH=cyankiwi/Qwen3.6-27B-AWQ-INT4
+#   QWEN_API_KEY=EMPTY
+# Env-var names are kept as QWEN_* for backwards compat with existing .env.bench
+# files; the values can point at any OpenAI-compatible endpoint. `or` is used
+# (not the second arg to getenv) so an empty string from compose pass-through
+# also falls through to the default.
+QWEN_BASE_URL = os.getenv("QWEN_BASE_URL") or "https://api.deepinfra.com/v1/openai"
+QWEN_MODEL = os.getenv("QWEN_MODEL") or "google/gemma-4-31B-it"
+QWEN_API_KEY = os.getenv("QWEN_API_KEY") or ""
 
 
 def _mask_password(url: str) -> str:
