@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-06-09
+
+### Changed
+
+- **`WIKI_ENABLED` now defaults to `true`** in both `braindb/wiki_scheduler.py`
+  and `docker-compose.yml`. A fresh `docker compose up` starts the wiki
+  maintainer + writer automatically. The pipeline is part of what makes
+  BrainDB a knowledge layer; idle ticks cost zero LLM (cheap SQL only),
+  and the previous opt-in default was a friction point in onboarding.
+  Set `WIKI_ENABLED=false` in `.env` to opt out (e.g. pure fact-store
+  deployments).
+- **Bench repo defaults flipped from workstation Qwen to deepinfra.**
+  `docker-compose.bench.yml`'s `LLM_PROFILE_BENCH` default is now
+  `deepinfra`; the judge endpoint defaults in `benchmarks/beam/config.py`
+  also point at deepinfra. Self-hosted Qwen runs are still supported —
+  set `LLM_PROFILE_BENCH=vllm_workstation_qwen` plus the judge overrides
+  in `.env.bench` (see `.env.bench.example`).
+
 ## [0.4.0] — 2026-06-03
 
 Headline: a focused pass on recall quality and the `view_tree` tool. The

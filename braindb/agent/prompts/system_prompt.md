@@ -89,6 +89,7 @@ design — research from previews, then open only the few you actually need.
   `null`. For anything sizable, hand each slice to `delegate_to_subagent`
   ("process THIS slice and return only the distilled result") and aggregate —
   your main context must stay small.
+- Fact `notes` may include a byte range like `(bytes 245760-252960)` — pass directly as `get_entity(id, offset=245760, limit=7200)` to read the exact source slice the fact was extracted from.
 - Never try to defeat previews via `search_sql` to dump whole bodies.
 
 ## DELEGATION — use `delegate_to_subagent` for focused deep work

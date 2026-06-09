@@ -42,11 +42,15 @@ FAILED_DIR = WATCH_DIR / "failed"
 ALLOWED_EXTS = {".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".log", ".html", ".xml"}
 SKIP_NAMES = {"README.md", ".gitkeep"}
 
-CHUNK_WORDS = 600           # target chunk size (~4-5k token context per extraction call — NIM-friendly)
+CHUNK_WORDS = 1200          # target chunk size (~7-8k char prompt, ~1.5K tokens of chunk text per call).
+                            # Bumped 600 -> 1200 once /agent/query's max_length cap was lifted to 40000;
+                            # halves the chunk count on big documents (so halves total round-trips).
+                            # The per-chunk agent now also creates cross-fact relations within the chunk
+                            # (see extract_facts_from_chunk), so there is no separate central_review pass.
 CHUNK_OVERLAP = 75          # words of overlap between adjacent chunks — catches facts that span a boundary
 
 INGEST_TIMEOUT = 60
-AGENT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "1200"))   # env-overridable; matches wiki_scheduler pattern. Generous default for slow / deep-exploring LLM runs.
+AGENT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "1800"))   # env-overridable; matches wiki_scheduler pattern. 30-min single-attempt cap leaves plenty of headroom for big-chunk runs where the cross-fact-relation tail extends past the ~6-min average.
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 logging.basicConfig(
@@ -109,27 +113,48 @@ def call_agent(prompt: str, max_turns: int = 8) -> str | None:
     return r.json().get("answer") or ""
 
 
-def split_chunks(text: str, chunk_words: int = CHUNK_WORDS, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split text into word-bounded chunks with configurable overlap.
+def split_chunks_with_offsets(
+    text: str, chunk_words: int = CHUNK_WORDS, overlap: int = CHUNK_OVERLAP,
+) -> list[tuple[str, int, int]]:
+    """Like :func:`split_chunks` but each entry is
+    ``(chunk_text, byte_start, byte_end)`` where ``byte_start``/``byte_end``
+    are positions in the ORIGINAL text (so ``text[byte_start:byte_end]``
+    recovers the original whitespace, not just the joined words).
 
-    Always splits at whitespace, never mid-word. Each chunk (after the first)
-    starts `overlap` words before the previous chunk's tail, so facts that
-    straddle a boundary are still visible in at least one chunk.
+    Used at extraction time so the recall-side agent can locate the exact
+    source slice for a fact via ``get_entity(id, offset=byte_start,
+    limit=byte_end - byte_start)`` instead of guessing byte offsets from
+    a word-based chunk number.
     """
-    words = text.split()
-    if not words:
+    word_positions = [(m.group(), m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+    if not word_positions:
         return []
     if overlap >= chunk_words:
         overlap = 0  # nonsensical config, fall back to no overlap
     step = chunk_words - overlap
-    chunks: list[str] = []
+    result: list[tuple[str, int, int]] = []
     i = 0
-    while i < len(words):
-        chunks.append(" ".join(words[i:i + chunk_words]))
-        if i + chunk_words >= len(words):
+    while i < len(word_positions):
+        end = min(i + chunk_words, len(word_positions))
+        slice_ = word_positions[i:end]
+        result.append((
+            " ".join(w[0] for w in slice_),
+            slice_[0][1],
+            slice_[-1][2],
+        ))
+        if end == len(word_positions):
             break
         i += step
-    return chunks
+    return result
+
+
+def split_chunks(text: str, chunk_words: int = CHUNK_WORDS, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """List of chunk strings. Thin back-compat wrapper around
+    :func:`split_chunks_with_offsets` — keeps the existing API stable for
+    callers that don't need byte offsets, and ensures the chunking logic
+    has a single source of truth.
+    """
+    return [t for (t, _, _) in split_chunks_with_offsets(text, chunk_words, overlap)]
 
 
 def fetch_entity(entity_id: str) -> dict | None:
@@ -142,10 +167,19 @@ def fetch_entity(entity_id: str) -> dict | None:
     return None
 
 
-def extract_facts_from_chunk(ds_id: str, title: str, idx: int, total: int, chunk_text: str) -> list[str]:
+def extract_facts_from_chunk(
+    ds_id: str, title: str, idx: int, total: int, chunk_text: str,
+    byte_start: int, byte_end: int,
+) -> list[str]:
     """Ask one agent call to extract facts from a chunk, save each via save_fact,
     and link each back to the datasource via create_relation(derived_from).
     Returns the list of new fact IDs parsed from the agent's final_answer answer.
+
+    ``byte_start``/``byte_end`` are the chunk's offset/length in the original
+    datasource text; they are baked into each saved fact's ``notes`` field so
+    a downstream recall agent can read the exact source slice via
+    ``get_entity(id, offset=byte_start, limit=byte_end-byte_start)`` instead
+    of guessing the location from the chunk number.
     """
     prompt = (
         f"A document was just ingested into BrainDB.\n"
@@ -155,30 +189,57 @@ def extract_facts_from_chunk(ds_id: str, title: str, idx: int, total: int, chunk
         f"Below is chunk {idx}/{total} of the document between <content> markers.\n"
         f"Extract the concrete, standalone FACTS from this chunk — specific claims,\n"
         f"numbers, events, named decisions. Ignore filler, opinion, and generic\n"
-        f"statements. Aim for quality over quantity: typically 3-8 facts per chunk.\n\n"
+        f"statements. Aim for quality over quantity: typically from 1-2 to 30 depending on density and length of the chunk.\n\n"
         f"For EACH fact:\n"
         f'  a) Call save_fact(content="<the fact in one sentence>",\n'
         f'     source="document", keywords=[2-4 precise tags],\n'
-        f'     notes="Extracted from {title} chunk {idx}/{total}"). Judge\n'
+        f'     notes="Extracted from {title} chunk {idx}/{total} '
+        f'(bytes {byte_start}-{byte_end})"). Judge\n'
         f"     certainty and importance per the tool's docstring guidance.\n"
         f"     Record the returned fact id.\n"
         f"  b) Call create_relation(from_entity_id=<fact_id>, "
         f'to_entity_id="{ds_id}", relation_type="derived_from",\n'
         f'     description="Fact extracted from {title}"). Judge\n'
         f"     relevance_score and importance_score per the tool's docstring.\n\n"
+        f"AFTER all facts in this chunk are saved, look back at the facts you just\n"
+        f"created and add cross-fact relations WITHIN this chunk where genuinely\n"
+        f"meaningful (not forced):\n"
+        f"  c) For pairs that semantically connect, call create_relation(from_entity_id=<id_A>,\n"
+        f'     to_entity_id=<id_B>, relation_type=<one of: supports, contradicts,\n'
+        f"     elaborates, similar_to, is_example_of>, description=\"<short why>\").\n"
+        f"     Skip if no pair clearly relates. Quality over quantity — typically 0-5\n"
+        f"     such relations per chunk.\n\n"
         f"Do NOT call get_entity. Do NOT call update_entity on the datasource.\n"
-        f"Do NOT touch the datasource content — it is read-only.\n\n"
-        f"When all facts in this chunk are processed, call final_answer with\n"
+        f"Do NOT touch the datasource content — it is read-only.\n"
+        f"Do NOT create relations to facts from OTHER chunks — you only see this one.\n\n"
+        f"When all facts AND cross-fact relations are saved, call final_answer with\n"
         f"exactly this format so the watcher can parse it:\n"
         f'  "Saved N facts from chunk {idx}/{total}: <fact_id_1>, <fact_id_2>, ..."\n\n'
         f"<content>\n{chunk_text}\n</content>"
     )
-    answer = call_agent(prompt, max_turns=40)
-    if not answer:
-        return []
-    fact_ids = UUID_RE.findall(answer)
-    # Filter out the datasource id if the model happened to echo it
-    return [fid for fid in fact_ids if fid != ds_id]
+    # 3-attempt retry around the per-chunk call. Retry ONLY when answer is None
+    # (HTTP error, timeout, connection failure) OR the parse produced zero fact
+    # UUIDs (agent never reached final_answer). If the first attempt DID save
+    # facts (parsed UUIDs in the answer string), do not retry — the facts are
+    # already committed via tool calls, and a retry would dupe them.
+    for attempt in range(1, 4):
+        answer = call_agent(prompt, max_turns=40)
+        if answer:
+            fact_ids = UUID_RE.findall(answer)
+            real_ids = [fid for fid in fact_ids if fid != ds_id]
+            if real_ids:
+                if attempt > 1:
+                    log.info("chunk %d/%d succeeded on attempt %d/3", idx, total, attempt)
+                return real_ids
+        if attempt < 3:
+            backoff = 5 * attempt   # 5s, then 10s
+            log.warning(
+                "chunk %d/%d attempt %d/3 produced no facts; retrying in %ds",
+                idx, total, attempt, backoff,
+            )
+            time.sleep(backoff)
+    log.warning("chunk %d/%d FAILED after 3 attempts", idx, total)
+    return []
 
 
 def central_review(ds_id: str, title: str, fact_ids: list[str]) -> None:
@@ -239,16 +300,18 @@ def enrich_datasource(ds: dict, file_path: Path) -> None:
         log.warning("enrichment read failed for %s: %s", ds_id[:8], e)
         return
 
-    chunks = split_chunks(text)
+    chunks = split_chunks_with_offsets(text)
     if not chunks:
         log.info("enrichment skipped for %s: empty content", ds_id[:8])
         return
     log.info("extraction started for %s: %d chunks", ds_id[:8], len(chunks))
 
     all_fact_ids: list[str] = []
-    for i, chunk in enumerate(chunks, start=1):
+    for i, (chunk, b_start, b_end) in enumerate(chunks, start=1):
         log.info("extracting facts chunk %d/%d for %s", i, len(chunks), ds_id[:8])
-        fact_ids = extract_facts_from_chunk(ds_id, title, i, len(chunks), chunk)
+        fact_ids = extract_facts_from_chunk(
+            ds_id, title, i, len(chunks), chunk, b_start, b_end,
+        )
         if fact_ids:
             log.info("chunk %d/%d saved %d facts", i, len(chunks), len(fact_ids))
             all_fact_ids.extend(fact_ids)
@@ -256,7 +319,12 @@ def enrich_datasource(ds: dict, file_path: Path) -> None:
             log.warning("chunk %d/%d produced no facts", i, len(chunks))
 
     log.info("extraction complete for %s: %d facts total", ds_id[:8], len(all_fact_ids))
-    central_review(ds_id, title, all_fact_ids)
+    # central_review(ds_id, title, all_fact_ids)
+    # ^ kept dormant; per-chunk handles cross-fact relations now (see
+    # extract_facts_from_chunk step c). Re-enable this line to restore the
+    # whole-document cross-fact synthesis pass — note it fails on big docs
+    # because the fact list builds a >10K-char prompt (see central_review
+    # docstring for the prompt-construction issue).
 
 
 def process_file(path: Path) -> None:

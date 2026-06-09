@@ -2,9 +2,17 @@
 Pure-function tests for the ingest watcher's chunk splitter.
 
 Covers: default chunk size, custom size, overlap, word boundaries, edge cases
-(empty, single word, exact chunk-size boundary).
+(empty, single word, exact chunk-size boundary). Also tests
+``split_chunks_with_offsets`` — the offset-aware variant whose byte ranges
+get stored in fact notes so the recall agent can locate the exact source
+slice via ``get_entity(offset, limit)`` instead of guessing from chunk number.
 """
-from braindb.ingest_watcher import split_chunks, CHUNK_WORDS, CHUNK_OVERLAP
+from braindb.ingest_watcher import (
+    CHUNK_OVERLAP,
+    CHUNK_WORDS,
+    split_chunks,
+    split_chunks_with_offsets,
+)
 
 
 def test_empty_text():
@@ -95,3 +103,86 @@ def test_words_are_preserved_exactly():
         for word in chunk.split():
             seen.add(word)
     assert seen == {"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"}
+
+
+# ---------- split_chunks_with_offsets ----------------------------------------
+
+
+def test_with_offsets_empty():
+    assert split_chunks_with_offsets("") == []
+    assert split_chunks_with_offsets("   \n\t  ") == []
+
+
+def test_with_offsets_single_chunk_basic():
+    text = "hello world there"
+    out = split_chunks_with_offsets(text, chunk_words=10, overlap=0)
+    assert len(out) == 1
+    chunk_text, b_start, b_end = out[0]
+    assert chunk_text == "hello world there"
+    assert b_start == 0
+    assert b_end == len(text)
+
+
+def test_with_offsets_recover_first_and_last_word():
+    """For every chunk, text[b_start:b_end] must START with the first chunk
+    word and END with the last chunk word. This is the core guarantee the
+    recall agent will rely on when paging by byte offset."""
+    # Use varied whitespace (multiple spaces, newlines, tabs) to make sure
+    # offsets track the original text, not the joined-words form.
+    text = (
+        "alpha  beta\nGamma\tdelta   epsilon "
+        "zeta eta theta iota kappa "
+        "lambda mu nu xi omicron pi rho "
+        "sigma tau upsilon phi chi psi omega"
+    )
+    out = split_chunks_with_offsets(text, chunk_words=5, overlap=1)
+    assert len(out) >= 4
+    for chunk_text, b_start, b_end in out:
+        slice_ = text[b_start:b_end]
+        first_word = chunk_text.split()[0]
+        last_word = chunk_text.split()[-1]
+        assert slice_.lstrip().startswith(first_word), (
+            f"slice {slice_!r} does not start with {first_word!r}"
+        )
+        assert slice_.rstrip().endswith(last_word), (
+            f"slice {slice_!r} does not end with {last_word!r}"
+        )
+
+
+def test_with_offsets_byte_end_in_bounds():
+    """No byte_end should ever exceed the length of the original text."""
+    text = " ".join(f"w{i}" for i in range(200))
+    out = split_chunks_with_offsets(text, chunk_words=50, overlap=10)
+    n = len(text)
+    for chunk_text, b_start, b_end in out:
+        assert 0 <= b_start <= b_end <= n
+        # And byte_end - byte_start is non-trivial
+        assert b_end > b_start
+
+
+def test_with_offsets_starts_advance_monotonically():
+    """Each successive chunk's byte_start must be > the previous chunk's
+    byte_start (we may overlap into the previous chunk's bytes, but we always
+    advance forward by at least one word)."""
+    text = " ".join(f"w{i}" for i in range(500))
+    out = split_chunks_with_offsets(text, chunk_words=50, overlap=10)
+    starts = [b_start for (_, b_start, _) in out]
+    assert starts == sorted(starts)
+    assert len(set(starts)) == len(starts), "duplicate byte_starts found"
+
+
+def test_split_chunks_back_compat_with_offsets():
+    """split_chunks must return exactly the chunk-text components of
+    split_chunks_with_offsets for the same inputs — proving the back-compat
+    wrapper has zero behavioural drift from the offset-aware function.
+    """
+    cases = [
+        "",
+        "hello",
+        " ".join(f"w{i}" for i in range(CHUNK_WORDS + 5)),
+        " ".join(f"w{i}" for i in range(CHUNK_WORDS * 3 + 17)),
+    ]
+    for text in cases:
+        a = split_chunks(text)
+        b = [t for (t, _, _) in split_chunks_with_offsets(text)]
+        assert a == b, f"divergence on text len={len(text)}"

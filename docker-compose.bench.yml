@@ -1,0 +1,197 @@
+# Standalone bench stack — NOT an overlay on docker-compose.yml.
+#
+# Runs alongside the personal BrainDB stack with strict isolation at every
+# layer: separate Docker project namespace, separate Postgres container,
+# separate volume, separate ports, separate host data dir. The personal
+# `braindb` database is never touched by anything here.
+#
+# Run with:
+#   docker compose -f docker-compose.bench.yml --env-file .env.bench up
+#
+# Plain `docker compose up` runs the personal stack as normal — the bench
+# stack cannot fire by accident.
+#
+# Safety properties (also enforced by code in benchmarks/beam/bench.py):
+#   - Postgres database is named `braindb_bench` (never `braindb`)
+#   - Postgres runs in its OWN container on host port 5434 (the user's
+#     personal Postgres is already on 5433, so bench takes 5434 to avoid
+#     a host-port collision)
+#   - The bench BrainDB API is on host port 8001 (not 8000)
+#   - The bench watcher mounts ./data_bench/ as /app/data, so it never
+#     sees files in ./data/ (the personal watcher's directory)
+#   - The bench runner asserts the active DATABASE_URL contains
+#     `braindb_bench` before any destructive op; refuses otherwise
+
+name: braindb_bench
+
+services:
+  postgres_bench:
+    # pgvector + pg_trgm baked in; matches what alembic migrations expect.
+    image: pgvector/pgvector:pg17
+    container_name: braindb_bench_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: braindb_bench
+      POSTGRES_USER: braindb_bench
+      # NOT a secret — bench-local only, never reachable from outside the
+      # host. The hard-coded safety check in bench.py looks for the
+      # literal "braindb_bench" substring in DATABASE_URL.
+      POSTGRES_PASSWORD: bench_local_only
+    ports:
+      # Personal Postgres is already on 5433 in this environment; bench
+      # takes 5434 to avoid a host-port collision. Verified before commit.
+      - "5434:5432"
+    volumes:
+      - braindb_bench_pgdata:/var/lib/postgresql/data
+    networks:
+      - bench-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U braindb_bench -d braindb_bench"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api_bench:
+    build: .
+    container_name: braindb_bench_api
+    restart: unless-stopped
+    depends_on:
+      postgres_bench:
+        condition: service_healthy
+    networks:
+      - bench-network
+    environment:
+      # MUST contain "braindb_bench" OR "braindb_conv_" or the bench runner
+      # refuses to start. The bench runner overrides this via the BENCH_DATABASE_URL
+      # env var when it creates per-conversation databases (braindb_conv_001, ...).
+      DATABASE_URL: ${BENCH_DATABASE_URL:-postgresql://braindb_bench:bench_local_only@postgres_bench:5432/braindb_bench}
+      API_PORT: 8001
+      HF_TOKEN: ${HF_TOKEN:-}
+      # Bench defaults to local Qwen via the workstation tunnel — matches the
+      # plan's Qwen-as-judge story. Override via .env.bench if needed.
+      LLM_PROFILE: ${LLM_PROFILE_BENCH:-deepinfra}
+      AGENT_MODEL: ${AGENT_MODEL:-}
+      NVIDIA_NIM_API_KEY: ${NVIDIA_NIM_API_KEY:-}
+      DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:-}
+      VLLM_API_KEY: ${VLLM_API_KEY:-EMPTY}
+      # Verbose by default during bench — every tool call is logged so the
+      # smoke tests can be audited.
+      AGENT_VERBOSE: ${AGENT_VERBOSE_BENCH:-true}
+      # Bench-specific tuning: wiki maintenance fires faster than prod's
+      # 30-min freshness window so per-conversation warmup stays in minutes.
+      WIKI_FRESHNESS_MINUTES: ${WIKI_FRESHNESS_MINUTES_BENCH:-1}
+    extra_hosts:
+      # Lets self-hosted profiles (vllm_workstation_qwen) reach a server
+      # bound to the Docker host's loopback or the SSH tunnel.
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8001:8001"
+    volumes:
+      # Bind the repo (for code reload) but OVERRIDE /app/data with the
+      # bench-only directory. The personal watcher polls ./data/sources/;
+      # the bench watcher polls ./data_bench/sources/. They cannot see
+      # each other's files.
+      - .:/app
+      - ./data_bench:/app/data
+    command: >
+      sh -c "alembic upgrade head && uvicorn braindb.main:app --host 0.0.0.0 --port 8001"
+
+  watcher_bench:
+    build: .
+    container_name: braindb_bench_watcher
+    restart: unless-stopped
+    depends_on:
+      - api_bench
+    networks:
+      - bench-network
+    environment:
+      BRAINDB_API_URL: http://api_bench:8001
+      # Faster poll than prod's 7s, so the smoke test feels responsive.
+      INGEST_POLL_INTERVAL: ${INGEST_POLL_INTERVAL_BENCH:-3}
+    volumes:
+      - .:/app
+      - ./data_bench:/app/data
+    command: python -m braindb.ingest_watcher
+
+  wiki_scheduler_bench:
+    build: .
+    container_name: braindb_bench_wiki_scheduler
+    restart: unless-stopped
+    depends_on:
+      - api_bench
+    networks:
+      - bench-network
+    environment:
+      BRAINDB_API_URL: http://api_bench:8001
+      # Wiki pipeline runs identical to prod — only the cadence changes.
+      WIKI_ENABLED: 'true'
+      WIKI_INTERVAL: ${WIKI_INTERVAL_BENCH:-5}
+    volumes:
+      - .:/app
+    command: python -m braindb.wiki_scheduler
+
+  # The bench_runner container is the orchestrator: it creates per-conversation
+  # databases, restarts api_bench with each new DATABASE_URL, drops the
+  # conversation .md into the watcher's dir, waits for warmup, asks the
+  # probing questions, records answers. Uses the same image as api_bench (so
+  # it has Python + BrainDB deps) plus the docker CLI installed at startup
+  # and the docker socket mounted so it can recreate api_bench.
+  #
+  # Profile "runner" means it does NOT auto-start with `docker compose up`;
+  # invoke it explicitly via:
+  #   docker compose -f docker-compose.bench.yml run --rm bench_runner \
+  #     python -m benchmarks.beam.bench --split 100K --limit 1
+  # bench_runner — orchestrator for the BEAM bench. Creates per-conversation
+  # Postgres databases, restarts api_bench with each new DATABASE_URL,
+  # drops the .md into the watcher's dir, waits for warmup, asks the probing
+  # questions. See benchmarks/beam/runner.Dockerfile.
+  #
+  # Profile "runner" means it does NOT auto-start with `docker compose up`.
+  # Invoke it explicitly:
+  #   docker compose -f docker-compose.bench.yml run --rm bench_runner \
+  #     python -m benchmarks.beam.bench --split 100K --limit 1
+  bench_runner:
+    build:
+      context: .
+      dockerfile: benchmarks/beam/runner.Dockerfile
+    container_name: braindb_bench_runner
+    profiles: ["runner"]
+    depends_on:
+      postgres_bench:
+        condition: service_healthy
+    networks:
+      - bench-network
+    environment:
+      # Bench-side runner reaches the api via Docker network DNS, no host port.
+      BENCH_API_BASE: http://api_bench:8001
+      # Per-conversation DB creation uses admin creds against postgres_bench's
+      # built-in `postgres` maintenance DB.
+      BENCH_ADMIN_DATABASE_URL: postgresql://braindb_bench:bench_local_only@postgres_bench:5432/postgres
+      # bench.py mints per-conv URLs by appending `/braindb_conv_NNN` to this.
+      BENCH_DB_BASE_URL: postgresql://braindb_bench:bench_local_only@postgres_bench:5432
+      # Judge LLM (OpenAI-compatible endpoint). Empty default — Python config
+      # in benchmarks/beam/config.py supplies the real default (deepinfra).
+      # Set QWEN_BASE_URL_BENCH / QWEN_MODEL_BENCH in .env.bench to point at
+      # a self-hosted vLLM endpoint (e.g. workstation Qwen on port 8010).
+      QWEN_BASE_URL: ${QWEN_BASE_URL_BENCH:-}
+      QWEN_MODEL: ${QWEN_MODEL_BENCH:-}
+      QWEN_API_KEY: ${QWEN_API_KEY:-${VLLM_API_KEY:-}}
+      HF_TOKEN: ${HF_TOKEN:-}
+      # Docker CLI invocations need to know which compose file + project.
+      COMPOSE_FILE: /app/docker-compose.bench.yml
+      COMPOSE_PROJECT_NAME: braindb_bench
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/app
+      - ./data_bench:/app/data
+      # Docker socket lets the runner recreate api_bench between conversations.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  braindb_bench_pgdata:
+    name: braindb_bench_pgdata
+
+networks:
+  bench-network:
+    name: braindb_bench_network
