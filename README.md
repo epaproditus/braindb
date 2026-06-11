@@ -37,13 +37,12 @@ Relations connect any two entities with `relation_type`, `relevance_score`, `imp
 
 ## Setup
 
-BrainDB runs as three Docker services — `api`, `watcher` (auto-ingests files), and `wiki_scheduler` (auto-maintains wikis) — against an **external** PostgreSQL you provide. The two sidecars are hands-off: you never call the pipeline by hand. The whole setup is six steps.
+BrainDB runs as Docker services — `api`, `watcher` (auto-ingests files), and `wiki_scheduler` (auto-maintains wikis) — plus a database that is either **bundled** (default, zero install) or **your own PostgreSQL**. The two sidecars are hands-off: you never call the pipeline by hand.
 
 ### 1. Prerequisites
 
-- Docker Desktop (or any Docker Engine)
-- A PostgreSQL 16 instance reachable from Docker (see step 3 for three common options)
-- The PostgreSQL extensions `pg_trgm` and `pgvector` must exist on the target database, and the connecting user must have permission to create them on first connection (migrations will `CREATE EXTENSION IF NOT EXISTS` on startup). If you don't have DB admin rights, ask an admin to pre-install both extensions.
+- Docker Desktop (or Docker Engine) with Compose v2.20+
+- That's it for the default setup — the database ships with the stack.
 
 ### 2. Clone and configure
 
@@ -53,9 +52,19 @@ cd braindb
 cp .env.example .env
 ```
 
-### 3. Point `.env` at your PostgreSQL
+### 3. Choose your database mode
 
-Edit `.env` and set `DATABASE_URL`. The value depends on **where your Postgres runs**:
+`.env.example` ships with the **internal DB** enabled — a bundled Postgres (with pgvector) that starts as part of the stack. For most users there is nothing to do in this step.
+
+The switch is one line in `.env`:
+
+```
+COMPOSE_PROFILES=internal-db    # present = bundled DB starts automatically
+```
+
+Optional internal-DB knobs (defaults are fine): `POSTGRES_PORT` (host port for inspecting the DB with psql/adminer, default 5435), `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`. Note: these are baked into the data volume on first boot — to reset later: `docker rm -f braindb_db && docker volume rm braindb_pgdata` (wipes its data).
+
+**Bring your own Postgres instead?** Remove the `COMPOSE_PROFILES` line and set `DATABASE_URL` — everything (host, port, db name, credentials) lives in that one URL:
 
 **Option A — Postgres running as another Docker container on the same network** (e.g. a `postgres_container`):
 ```
@@ -72,7 +81,8 @@ DATABASE_URL=postgresql://postgres:password@host.docker.internal:5432/braindb
 ```
 DATABASE_URL=postgresql://user:password@db.example.com:5432/braindb
 ```
-Any reachable hostname/IP works — the connecting user just needs network access, auth, and the extensions mentioned in step 1.
+
+External databases need the `pg_trgm` and `pgvector` extensions; the connecting user must be able to create them on first connection (migrations run `CREATE EXTENSION IF NOT EXISTS` on startup), or an admin pre-installs both.
 
 ### 4. Pick an LLM provider (for the internal agent)
 
@@ -91,14 +101,16 @@ Adding a third provider (Together, OpenAI, local vLLM, whatever) is a two-line e
 
 ### 5. Create the Docker network, then bring the stack up
 
-`docker-compose.yml` expects an external network called `local-network` so the `api` and `watcher` containers can reach your Postgres (and each other) by DNS name:
+`docker-compose.yml` expects an external network called `local-network` so the containers can reach each other (and an external Postgres, if you use one) by DNS name:
 
 ```bash
 docker network create local-network   # one-time, ignore error if it already exists
 docker compose up -d --build
 ```
 
-If your Postgres is a container (Option A in step 3), attach it to this network too:
+With the internal DB (default), this also starts the bundled Postgres and waits for it to be healthy before the API boots.
+
+If you brought your own Postgres as a container (Option A in step 3), attach it to this network too:
 ```bash
 docker network connect local-network postgres_container
 ```
