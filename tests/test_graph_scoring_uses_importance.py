@@ -11,16 +11,38 @@ that /memory/context layers on top.
 """
 import uuid
 
+import pytest
 import requests
 from braindb.db import get_conn
 from braindb.services.graph import graph_expand
+
+
+def _direct_db_reachable() -> bool:
+    try:
+        with get_conn():
+            return True
+    except Exception:
+        return False
+
+
+# This test drives graph_expand() over a direct DB connection (by design —
+# it locks the SQL CTE, not the HTTP layer). Inside docker, DATABASE_URL
+# points at a docker-network hostname that doesn't resolve from the host.
+# Skip unless DATABASE_URL is host-reachable, e.g. for the internal DB:
+#   DATABASE_URL=postgresql://braindb:braindb@localhost:5435/braindb pytest ...
+pytestmark = pytest.mark.skipif(
+    not _direct_db_reachable(),
+    reason="DATABASE_URL not reachable from the pytest host; set it to a "
+    "host-reachable address to run direct-DB graph tests",
+)
 
 
 def test_importance_score_moves_per_hop_relevance(api, make_fact):
     """Two relations from the same seed, identical relation_type and
     relevance_score, ONLY differing in importance_score. The hop's
     accumulated_relevance from graph_expand must reflect the difference."""
-    tag = uuid.uuid4().hex
+    # _pytest_ prefix so the session sweep can reclaim the keyword entity
+    tag = f"_pytest_{uuid.uuid4().hex[:8]}"
     seed = make_fact(f"Seed for {tag}", keywords=[tag])
     hi_target = make_fact("Generic hi target.")
     lo_target = make_fact("Generic lo target.")

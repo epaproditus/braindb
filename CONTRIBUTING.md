@@ -4,13 +4,13 @@ Thanks for your interest. BrainDB is a small, opinionated project — the bar is
 
 ## Dev setup
 
-Prerequisites: Docker Desktop (or any Docker Engine), Python 3.12, a Postgres 16 instance reachable from the container.
+Prerequisites: Docker Desktop (or Docker Engine) with Compose v2.20+, Python 3.12. The database is bundled by default (`COMPOSE_PROFILES=internal-db` in `.env.example`); to use your own Postgres instead, remove that line and set `DATABASE_URL` — see the README's Setup section.
 
 ```bash
 git clone <repo-url> braindb
 cd braindb
 cp .env.example .env
-# edit .env — set DATABASE_URL; recommended LLM_PROFILE=deepinfra + DEEPINFRA_API_KEY (or any other profile)
+# edit .env — recommended LLM_PROFILE=deepinfra + DEEPINFRA_API_KEY (or any other profile)
 
 docker network create local-network       # one-time; docker-compose expects this
 docker compose up -d --build
@@ -26,10 +26,14 @@ pip install -e ".[dev]"
 
 ## Running tests
 
+The suite runs against an **isolated test stack** (its own API on port 8002 + its own throwaway Postgres) — never against your personal BrainDB database:
+
 ```bash
-pytest                              # full suite (needs the stack up)
+docker compose -f docker-compose.test.yml up -d     # start the test stack
+pytest                              # full suite
 pytest -k "not agent"               # skip the live-LLM smoke tests
 pytest tests/test_split_chunks.py   # a single file
+docker compose -f docker-compose.test.yml down -v   # stop + wipe test data
 ```
 
 See [`tests/README.md`](tests/README.md) for what is and isn't covered.

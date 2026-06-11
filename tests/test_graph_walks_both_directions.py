@@ -14,13 +14,35 @@ tests with arbitrary DB state.
 """
 import uuid
 
+import pytest
 import requests
 from braindb.db import get_conn
 from braindb.services.graph import graph_expand
 
 
+def _direct_db_reachable() -> bool:
+    try:
+        with get_conn():
+            return True
+    except Exception:
+        return False
+
+
+# This test drives graph_expand() over a direct DB connection (by design —
+# it locks the SQL CTE, not the HTTP layer). Inside docker, DATABASE_URL
+# points at a docker-network hostname that doesn't resolve from the host.
+# Skip unless DATABASE_URL is host-reachable, e.g. for the internal DB:
+#   DATABASE_URL=postgresql://braindb:braindb@localhost:5435/braindb pytest ...
+pytestmark = pytest.mark.skipif(
+    not _direct_db_reachable(),
+    reason="DATABASE_URL not reachable from the pytest host; set it to a "
+    "host-reachable address to run direct-DB graph tests",
+)
+
+
 def test_graph_expand_walks_unidirectional_edge_backwards(api, make_fact):
-    tag = uuid.uuid4().hex
+    # _pytest_ prefix so the session sweep can reclaim the keyword entity
+    tag = f"_pytest_{uuid.uuid4().hex[:8]}"
 
     # A is the "from" side. B is the "to" side and is the SEED.
     # Edge: A -> B with is_bidirectional=false (default).

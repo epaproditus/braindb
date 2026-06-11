@@ -1,15 +1,19 @@
 """
 Shared pytest fixtures for BrainDB integration tests.
 
-These tests run against a live, running BrainDB stack (`docker compose up -d`).
-They don't mock the API or the DB — they exercise the real HTTP endpoints and
-real PostgreSQL. Each test self-registers the entity IDs it creates so a
-session-scoped teardown can delete exactly those, leaving your real data
-untouched.
+The suite runs against the ISOLATED TEST STACK — its own API + its own
+throwaway Postgres, never your personal BrainDB database. Start it first:
 
-Requirements to run the suite:
-  - API reachable at http://localhost:8000 (override with BRAINDB_TEST_URL)
-  - A healthy stack (/health returns 200)
+    docker compose -f docker-compose.test.yml up -d
+
+then run `pytest`, and tear down (wiping all test data) with:
+
+    docker compose -f docker-compose.test.yml down -v
+
+The tests exercise the real HTTP endpoints and real PostgreSQL — no mocks.
+Each test registers the entity IDs it creates and deletes them at teardown,
+but because the whole database is disposable, nothing depends on cleanup
+being perfect.
 
 Nothing here touches the agent's LLM backend; tests that hit /agent/query
 send trivial prompts and don't rely on any specific model.
@@ -25,7 +29,16 @@ import pytest
 import requests
 
 
-API_URL = os.getenv("BRAINDB_TEST_URL", "http://localhost:8000")
+# The isolated test stack (docker-compose.test.yml). Override only if you
+# really mean to point the suite somewhere else.
+API_URL = os.getenv("BRAINDB_TEST_URL", "http://localhost:8002")
+
+# A handful of tests drive internal services (e.g. graph_expand) over a
+# direct DB connection. Default it to the test stack's Postgres, published
+# on the host at 5436. An explicit DATABASE_URL in the environment wins.
+os.environ.setdefault(
+    "DATABASE_URL", "postgresql://braindb:braindb@localhost:5436/braindb_test"
+)
 
 
 def _wait_for_health(url: str, timeout: int = 30) -> bool:
@@ -43,65 +56,19 @@ def _wait_for_health(url: str, timeout: int = 30) -> bool:
 
 @pytest.fixture(scope="session", autouse=True)
 def _require_live_api() -> None:
-    """Fail fast and loud if the stack isn't up — tests have nothing to run against."""
+    """Fail fast and loud if the test stack isn't up.
+
+    Deliberately NOT defaulting to the personal stack on :8000 — the suite
+    must never run against a database holding real data.
+    """
     if not _wait_for_health(API_URL):
         pytest.fail(
-            f"BrainDB API not healthy at {API_URL}. "
-            "Run `docker compose up -d` from the repo root first."
+            f"BrainDB test API not healthy at {API_URL}. Start the isolated "
+            "test stack first:\n"
+            "    docker compose -f docker-compose.test.yml up -d\n"
+            "and tear it down (wiping all test data) with:\n"
+            "    docker compose -f docker-compose.test.yml down -v"
         )
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _purge_pytest_artefacts_at_session_end() -> Iterator[None]:
-    """Session teardown safety net for the per-test `created_entities`
-    fixture: any test that errors before registering its IDs (or that
-    bypasses the factories entirely) still leaks `_pytest_<hex>` rows
-    into the live DB. After all tests finish, sweep those out.
-
-    Pattern uniqueness: `_pytest_<8-hex>` is generated only by the
-    `test_tag` fixture above and never by production code — so a
-    `content LIKE '_pytest_%'` filter on keyword entities is provably
-    scoped to test artefacts.
-
-    Order matters: delete tagged entities (facts/thoughts/...) FIRST so
-    their `tagged_with` edges drop via FK cascade, then the keyword
-    entities themselves.
-    """
-    yield
-    try:
-        from braindb.db import get_conn  # only imported at teardown
-    except Exception as exc:   # noqa: BLE001 — defensive, never block the session
-        print(f"\n[conftest] session cleanup skipped (db import failed): {exc}")
-        return
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    DELETE FROM entities WHERE id IN (
-                      SELECT r.from_entity_id FROM relations r
-                      JOIN entities kw ON kw.id = r.to_entity_id
-                      WHERE r.relation_type = 'tagged_with'
-                        AND kw.entity_type = 'keyword'
-                        AND kw.content LIKE E'\\_pytest\\_%' ESCAPE '\\'
-                    )
-                    """
-                )
-                tagged_deleted = cur.rowcount
-                cur.execute(
-                    """
-                    DELETE FROM entities
-                    WHERE entity_type = 'keyword'
-                      AND content LIKE E'\\_pytest\\_%' ESCAPE '\\'
-                    """
-                )
-                kw_deleted = cur.rowcount
-        print(
-            f"\n[conftest] session cleanup: removed {tagged_deleted} "
-            f"tagged entities + {kw_deleted} _pytest_* keywords"
-        )
-    except Exception as exc:   # noqa: BLE001 — never break the session on cleanup
-        print(f"\n[conftest] session cleanup error (ignored): {exc}")
 
 
 @pytest.fixture
