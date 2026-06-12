@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before. Optional knobs: `POSTGRES_PORT` (host inspection port, default
   5435, loopback-only), `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`.
   Requires Docker Compose >= 2.20. Closes the request in issue #12.
+- **Frontend served by the stack.** A `frontend` service (nginx:alpine over
+  the static `frontend/` directory) joins `docker compose up -d` — the
+  read-only browser UI is now at `http://localhost:8642` with zero manual
+  steps (`FRONTEND_PORT` to change it; loopback-only). The manual
+  static-server route still works as before.
+- **Logo + architecture diagrams.** The BrainDB logo tops the README and the
+  frontend header (plus favicon), and five SVG diagrams — the keyword-graph
+  mechanism, retrieval pipeline, save/ingest lanes, wiki maintainer loop, and
+  wiki writer pipeline — illustrate their README sections. Assets live in
+  `docs/assets/`.
 
 ### Fixed
 

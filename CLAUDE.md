@@ -87,8 +87,8 @@ braindb/
 ├── skills/                            # Shipped Claude Code skills
 │   ├── braindb/SKILL.md               # Direct curl-based skill
 │   └── braindb-agent/SKILL.md         # Thin wrapper around the agent endpoint
-├── frontend/                          # Read-only browser UI — vanilla JS, no build
-├── docker-compose.yml                 # api + watcher services (external PostgreSQL)
+├── frontend/                          # Read-only browser UI — vanilla JS, no build (served at :8642)
+├── docker-compose.yml                 # api + watcher + wiki_scheduler + frontend (+ optional bundled Postgres)
 ├── .env                               # Real credentials — DO NOT COMMIT
 └── BRAINDB_GUIDE.md                   # Full API reference with curl examples
 ```
