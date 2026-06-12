@@ -65,10 +65,6 @@ services:
       - .:/app
     command: python -m braindb.ingest_watcher
 
-  # Always-on wiki maintenance sidecar — same posture as `watcher`. It loops
-  # cron -> maintain -> write so wikis self-organise from entities with zero
-  # manual steps. To run without it (e.g. cost control), start the stack
-  # excluding this service or scale it to 0 — exactly as you would the watcher.
   # Bundled Postgres (pgvector) — exists ONLY when the internal-db profile is
   # active, i.e. when .env contains COMPOSE_PROFILES=internal-db. Without that
   # line this service is invisible to every compose command and external-DB
@@ -100,6 +96,10 @@ services:
     networks:
       - local-network
 
+  # Always-on wiki maintenance sidecar — same posture as `watcher`. It loops
+  # cron -> maintain -> write so wikis self-organise from entities with zero
+  # manual steps. To run without it (e.g. cost control), start the stack
+  # excluding this service or scale it to 0 — exactly as you would the watcher.
   wiki_scheduler:
     build: .
     container_name: braindb_wiki_scheduler
@@ -115,6 +115,21 @@ services:
     volumes:
       - .:/app
     command: python -m braindb.wiki_scheduler
+
+  # Read-only browser UI (frontend/ — plain static files, no build step).
+  # Loopback-only on purpose: the UI's API calls go to http://localhost:8000
+  # from the BROWSER, so publishing this port beyond loopback wouldn't make
+  # the app usable remotely anyway. Change FRONTEND_PORT in .env if taken.
+  frontend:
+    image: nginx:alpine
+    container_name: braindb_frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8642}:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    networks:
+      - local-network
 
 volumes:
   # Data volume for the bundled internal DB (internal-db profile only).
