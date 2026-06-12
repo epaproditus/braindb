@@ -1,0 +1,65 @@
+# Isolated test stack — what `pytest` runs against. NEVER your real data.
+#
+#   docker compose -f docker-compose.test.yml up -d     # start
+#   pytest                                              # run the suite
+#   docker compose -f docker-compose.test.yml down -v   # stop + wipe test data
+#
+# Own project namespace, own Postgres + volume, own network, own ports
+# (api 8002, db 5436 — the personal stack uses 8000, the bench 8001/5434).
+# No watcher and no wiki scheduler: tests exercise the API directly, and
+# with no background extraction the suite is deterministic.
+#
+# LLM credentials pass through from the repo .env so the live-agent smoke
+# test works; everything else is fully isolated from the personal stack.
+
+name: braindb_test
+
+services:
+  braindb_test_db:
+    image: pgvector/pgvector:pg17
+    container_name: braindb_test_db
+    environment:
+      POSTGRES_USER: braindb
+      POSTGRES_PASSWORD: braindb
+      POSTGRES_DB: braindb_test
+    ports:
+      # Loopback-only. Published so the handful of direct-DB tests
+      # (e.g. graph_expand) can connect from the host.
+      - "127.0.0.1:5436:5432"
+    volumes:
+      - braindb_test_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U braindb -d braindb_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  braindb_test_api:
+    build: .
+    container_name: braindb_test_api
+    depends_on:
+      braindb_test_db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://braindb:braindb@braindb_test_db:5432/braindb_test
+      API_PORT: 8002
+      HF_TOKEN: ${HF_TOKEN:-}
+      LLM_PROFILE: ${LLM_PROFILE:-deepinfra}
+      AGENT_MODEL: ${AGENT_MODEL:-}
+      NVIDIA_NIM_API_KEY: ${NVIDIA_NIM_API_KEY:-}
+      DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:-}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      AGENT_VERBOSE: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8002:8002"
+    volumes:
+      - .:/app
+      - ./data_test:/app/data
+    command: >
+      sh -c "alembic upgrade head && uvicorn braindb.main:app --host 0.0.0.0 --port 8002"
+
+volumes:
+  braindb_test_pgdata:
+    name: braindb_test_pgdata

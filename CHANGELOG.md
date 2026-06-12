@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-06-12
+
+### Added
+
+- **Bundled internal Postgres (opt-in by one `.env` line).** A `braindb_db`
+  service (pgvector/pg17) guarded by the `internal-db` compose profile.
+  `.env.example` now ships `COMPOSE_PROFILES=internal-db`, so a fresh clone
+  gets a working database with plain `docker compose up -d` — nothing to
+  install. Existing setups are untouched: without that line the service does
+  not exist and `DATABASE_URL` keeps pointing at your own Postgres exactly as
+  before. Optional knobs: `POSTGRES_PORT` (host inspection port, default
+  5435, loopback-only), `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`.
+  Requires Docker Compose >= 2.20. Closes the request in issue #12.
+- **Frontend served by the stack.** A `frontend` service (nginx:alpine over
+  the static `frontend/` directory) joins `docker compose up -d` — the
+  read-only browser UI is now at `http://localhost:8642` with zero manual
+  steps (`FRONTEND_PORT` to change it; loopback-only). The manual
+  static-server route still works as before.
+- **Logo + architecture diagrams.** The BrainDB logo tops the README and the
+  frontend header (plus favicon), and five SVG diagrams — the keyword-graph
+  mechanism, retrieval pipeline, save/ingest lanes, wiki maintainer loop, and
+  wiki writer pipeline — illustrate their README sections. Assets live in
+  `docs/assets/`.
+
+### Fixed
+
+- **Test suite no longer touches your database — at all.** The suite now
+  runs against an isolated test stack (`docker-compose.test.yml`: its own
+  API on port 8002 + its own throwaway Postgres), and the session-end
+  cleanup that deleted pattern-matched rows from the configured database
+  has been removed entirely. Previously the tests ran against the live
+  personal stack and their cleanup silently failed from the host, leaking
+  `_pytest_*` keyword entities into real data (where the wiki maintainer
+  wasted LLM calls triaging them). Now: `docker compose -f
+  docker-compose.test.yml up -d && pytest`, and `down -v` wipes everything.
+
 ## [0.5.0] — 2026-06-09
 
 ### Changed

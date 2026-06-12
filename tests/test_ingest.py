@@ -17,8 +17,11 @@ from pathlib import Path
 import requests
 
 
+# The test stack (docker-compose.test.yml) mounts ./data_test as /app/data,
+# so test files live in data_test/ — the personal stack's watcher (polling
+# ./data/sources/) never sees them.
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TEST_FILE = REPO_ROOT / "data" / "sources" / "pytest_ingest_sample.md"
+TEST_FILE = REPO_ROOT / "data_test" / "sources" / "pytest_ingest_sample.md"
 TEST_FILE_RELATIVE = "data/sources/pytest_ingest_sample.md"
 
 
@@ -30,9 +33,9 @@ def _write_sample(text: str) -> None:
 def _cleanup_file() -> None:
     for p in [
         TEST_FILE,
-        REPO_ROOT / "data" / "sources" / "ingested" / "pytest_ingest_sample.md",
-        REPO_ROOT / "data" / "sources" / "failed" / "pytest_ingest_sample.md",
-        REPO_ROOT / "data" / "sources" / "failed" / "pytest_ingest_sample.md.error.txt",
+        REPO_ROOT / "data_test" / "sources" / "ingested" / "pytest_ingest_sample.md",
+        REPO_ROOT / "data_test" / "sources" / "failed" / "pytest_ingest_sample.md",
+        REPO_ROOT / "data_test" / "sources" / "failed" / "pytest_ingest_sample.md.error.txt",
     ]:
         try:
             if p.exists():

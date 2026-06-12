@@ -58,3 +58,6 @@ benchmarks/*/answers/
 # Bench compose: separate host data dir for the bench watcher, separate env file
 data_bench/
 .env.bench
+
+# Test stack (docker-compose.test.yml): separate host data dir for test ingests
+data_test/

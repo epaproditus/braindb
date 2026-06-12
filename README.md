@@ -1,4 +1,6 @@
-# BrainDB
+<p align="center">
+  <img src="docs/assets/braindb-logo.svg" width="460" alt="BrainDB">
+</p>
 
 [![BrainDB walkthrough](https://img.youtube.com/vi/AJ7iMOj4vvA/maxresdefault.jpg)](https://youtu.be/AJ7iMOj4vvA "Watch the BrainDB walkthrough on YouTube")
 
@@ -17,6 +19,10 @@ Inspired by Karpathy's [LLM wiki idea](https://gist.github.com/karpathy/442a6bf5
 - **vs. RAG.** RAG is stateless: embed documents, retrieve similar chunks on every query, stuff them into context. There's no notion of *an entity* that persists, accrues connections, or ages. BrainDB stores typed entities (thoughts, facts, sources, documents, rules) with explicit `supports` / `contradicts` / `elaborates` / `derived_from` / `similar_to` relations, combined fuzzy + semantic search, graph traversal up to 3 hops, and temporal decay so stale items fade while accessed ones stay sharp. Retrieval returns a ranked graph neighbourhood, not a pile of chunks.
 - **vs. classic graph DBs** (Neo4j, Memgraph). Those are general-purpose graph stores with their own query languages and ops cost. BrainDB is purpose-built for LLM agents: a plain HTTP API designed for tool-calling, semantically meaningful fields (`certainty`, `importance`, `emotional_valence`), built-in text + pgvector search with geometric-mean scoring, always-on rule injection, automatic provenance, and runs on plain PostgreSQL + `pg_trgm` + `pgvector` — no new infrastructure to operate.
 - **vs. markdown files as memory.** Markdown wikis are flat and unstructured: the LLM has to grep, read whole files into context, and manage linking by hand. BrainDB's entities are atomic, queryable, ranked, and self-connecting. Facts extracted from a document automatically link back to the source via `derived_from`; recall returns relevant nodes plus their graph neighbourhood; nothing needs to be read in full unless the agent asks for it.
+
+<p align="center">
+  <img src="docs/assets/braindb-mechanism.svg" width="660" alt="One keyword, one graph — facts, a wiki article, and a derived thought all connect through a central keyword entity that carries the embedding">
+</p>
 
 ---
 
@@ -37,13 +43,12 @@ Relations connect any two entities with `relation_type`, `relevance_score`, `imp
 
 ## Setup
 
-BrainDB runs as three Docker services — `api`, `watcher` (auto-ingests files), and `wiki_scheduler` (auto-maintains wikis) — against an **external** PostgreSQL you provide. The two sidecars are hands-off: you never call the pipeline by hand. The whole setup is six steps.
+BrainDB runs as Docker services — `api`, `watcher` (auto-ingests files), `wiki_scheduler` (auto-maintains wikis), and a read-only browser `frontend` — plus a database that is either **bundled** (default, zero install) or **your own PostgreSQL**. The two sidecars are hands-off: you never call the pipeline by hand.
 
 ### 1. Prerequisites
 
-- Docker Desktop (or any Docker Engine)
-- A PostgreSQL 16 instance reachable from Docker (see step 3 for three common options)
-- The PostgreSQL extensions `pg_trgm` and `pgvector` must exist on the target database, and the connecting user must have permission to create them on first connection (migrations will `CREATE EXTENSION IF NOT EXISTS` on startup). If you don't have DB admin rights, ask an admin to pre-install both extensions.
+- Docker Desktop (or Docker Engine) with Compose v2.20+
+- That's it for the default setup — the database ships with the stack.
 
 ### 2. Clone and configure
 
@@ -53,9 +58,19 @@ cd braindb
 cp .env.example .env
 ```
 
-### 3. Point `.env` at your PostgreSQL
+### 3. Choose your database mode
 
-Edit `.env` and set `DATABASE_URL`. The value depends on **where your Postgres runs**:
+`.env.example` ships with the **internal DB** enabled — a bundled Postgres (with pgvector) that starts as part of the stack. For most users there is nothing to do in this step.
+
+The switch is one line in `.env`:
+
+```
+COMPOSE_PROFILES=internal-db    # present = bundled DB starts automatically
+```
+
+Optional internal-DB knobs (defaults are fine): `POSTGRES_PORT` (host port for inspecting the DB with psql/adminer, default 5435), `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`. Note: these are baked into the data volume on first boot — to reset later: `docker rm -f braindb_db && docker volume rm braindb_pgdata` (wipes its data).
+
+**Bring your own Postgres instead?** Remove the `COMPOSE_PROFILES` line and set `DATABASE_URL` — everything (host, port, db name, credentials) lives in that one URL:
 
 **Option A — Postgres running as another Docker container on the same network** (e.g. a `postgres_container`):
 ```
@@ -72,7 +87,8 @@ DATABASE_URL=postgresql://postgres:password@host.docker.internal:5432/braindb
 ```
 DATABASE_URL=postgresql://user:password@db.example.com:5432/braindb
 ```
-Any reachable hostname/IP works — the connecting user just needs network access, auth, and the extensions mentioned in step 1.
+
+External databases need the `pg_trgm` and `pgvector` extensions; the connecting user must be able to create them on first connection (migrations run `CREATE EXTENSION IF NOT EXISTS` on startup), or an admin pre-installs both.
 
 ### 4. Pick an LLM provider (for the internal agent)
 
@@ -91,14 +107,16 @@ Adding a third provider (Together, OpenAI, local vLLM, whatever) is a two-line e
 
 ### 5. Create the Docker network, then bring the stack up
 
-`docker-compose.yml` expects an external network called `local-network` so the `api` and `watcher` containers can reach your Postgres (and each other) by DNS name:
+`docker-compose.yml` expects an external network called `local-network` so the containers can reach each other (and an external Postgres, if you use one) by DNS name:
 
 ```bash
 docker network create local-network   # one-time, ignore error if it already exists
 docker compose up -d --build
 ```
 
-If your Postgres is a container (Option A in step 3), attach it to this network too:
+With the internal DB (default), this also starts the bundled Postgres and waits for it to be healthy before the API boots.
+
+If you brought your own Postgres as a container (Option A in step 3), attach it to this network too:
 ```bash
 docker network connect local-network postgres_container
 ```
@@ -110,7 +128,7 @@ curl http://localhost:8000/health
 # {"status":"ok","embeddings":true}
 ```
 
-API at `http://localhost:8000`. Swagger UI at `http://localhost:8000/docs`. Database migrations run automatically on startup.
+API at `http://localhost:8000`. Swagger UI at `http://localhost:8000/docs`. Browser UI (read-only frontend) at `http://localhost:8642`. Database migrations run automatically on startup.
 
 Drop a markdown file into `data/sources/` and the watcher sidecar picks it up within ~7 seconds — see [File Ingestion](#file-ingestion) below.
 
@@ -149,6 +167,8 @@ See [BRAINDB_GUIDE.md](BRAINDB_GUIDE.md) for full API reference with curl exampl
 ## How Retrieval Works
 
 `POST /api/v1/memory/context` is the main endpoint. **Keywords are the indexing layer** — both the fuzzy and the embedding pathways match the query against keyword-entity content / embeddings, then entities surface via `tagged_with` edges. A keyword tagged on many entities is the hub; you don't need explicit `elaborates` / `refers_to` edges for an entity to be findable, as long as it has the right keywords.
+
+![Retrieval pipeline — queries fan out to parallel fuzzy and semantic keyword matching, merge, graph-expand, and rank; always-on rules join the ranked context](docs/assets/braindb-retrieval.svg)
 
 1. **Multi-query search** — pass `queries: ["topic1", "topic2"]` to search multiple angles at once. Each query is matched against keyword entities by both pg_trgm trigram similarity AND query-embedding-vs-keyword-embedding cosine similarity; results are merged with the geometric mean (configurable `missing_signal_penalty` when only one signal fires).
 2. **Per-search-term reservation (L1 diversity quota)** — each query you pass gets a guaranteed share of the result slots filled from THAT query's own top-ranked entities. Bare-keyword queries (`"Petros"`) reliably surface specific facts even when paired with broader semantic angles.
@@ -269,6 +289,8 @@ Replace `/ABSOLUTE/PATH/TO/braindb` with your repo path. The hook is async (non-
 
 Drop a file in `data/sources/` — the always-on watcher sidecar picks it up within 7s, ingests it, and runs a chunked fact-extraction pipeline that saves atomic facts into the knowledge graph linked back to the source via `derived_from` relations. Processed files move to `data/sources/ingested/`, failures to `data/sources/failed/` with an `.error.txt` sidecar.
 
+![Save and ingest — the direct API lane, the agent lane, and the file-ingest watcher pipeline all converge into the knowledge graph](docs/assets/braindb-ingestion.svg)
+
 ```bash
 cp ~/some-article.md data/sources/
 docker logs braindb_watcher -f   # watch the pipeline
@@ -300,6 +322,10 @@ docker logs braindb_wiki_scheduler -f   # the autonomous loop
 docker logs braindb_api -f              # the agent doing the work
 ```
 
+![Wiki scheduler and maintainer loop — cron scans for entities not yet covered, the maintainer decides attach / create / consolidate / skip, suggestion jobs hand off to the writer, and the loop repeats](docs/assets/braindb-upkeep-loop.svg)
+
+![Wiki writer pipeline — lock and snapshot, gather context, draft with citations, reconcile relations, validate with retry, then commit a reversible living wiki page](docs/assets/braindb-writer.svg)
+
 You do **not** drive this by hand. The `POST /api/v1/wiki/{cron,maintain,write}`
 endpoints exist for **debugging / inspection only** — normal operation is the
 sidecar. (Optional read-only review: `docker compose exec api python -m
@@ -311,15 +337,11 @@ automatically. To run without it, bring the stack up excluding the service or
 scale it to 0 (`docker compose up -d --scale wiki_scheduler=0`), exactly as
 you would for the watcher; or point `LLM_PROFILE` at a local model.
 
-## Frontend (optional, read-only)
+## Frontend (read-only browser UI)
 
-A small vanilla-JS frontend ships under `frontend/` — no build step. Three views (Reader for browsing wikis, Graph for visual exploration, Ops for watching the maintainer/writer pipeline) plus an Ask drawer that talks to the agent endpoint. Talks to the BrainDB API at `http://localhost:8000`. Serve it from the repo root:
+A small vanilla-JS frontend ships under `frontend/` — no build step — and is served by the stack itself: after `docker compose up -d`, open **`http://localhost:8642`** (change the port with `FRONTEND_PORT` in `.env`). Three views (Reader for browsing wikis, Graph for visual exploration, Ops for watching the maintainer/writer pipeline) plus an Ask drawer that talks to the agent endpoint. The UI calls the BrainDB API at `http://localhost:8000` from your browser.
 
-```bash
-cd frontend && python -m http.server 8090
-```
-
-Then open `http://localhost:8090`. See [frontend/README.md](frontend/README.md) for the design notes.
+Prefer no extra container? Any static file server over `frontend/` works too, e.g. `cd frontend && python -m http.server 8642`. See [frontend/README.md](frontend/README.md) for the design notes.
 
 ## Stack
 
@@ -328,4 +350,4 @@ Then open `http://localhost:8090`. See [frontend/README.md](frontend/README.md) 
 - Alembic migrations
 - `sentence-transformers` + `Qwen/Qwen3-Embedding-0.6B` for keyword embeddings
 - `openai-agents[litellm]` + LiteLLM for the internal agent (DeepInfra / NIM / others pluggable via `LLM_PROFILE`)
-- Docker Compose — `api` + `watcher` + `wiki_scheduler` services, external PostgreSQL
+- Docker Compose — `api` + `watcher` + `wiki_scheduler` + `frontend` services, with a bundled Postgres (default) or your own

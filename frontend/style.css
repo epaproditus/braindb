@@ -114,6 +114,7 @@ input:focus, textarea:focus {
   color: var(--ink);
   margin-right: 24px;
 }
+.brand img { display: block; height: 28px; }
 .tabs { display: flex; gap: 4px; flex: 1; }
 .tab {
   border: none;

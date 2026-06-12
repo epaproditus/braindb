@@ -4,17 +4,15 @@ A thin, read-mostly browser UI for BrainDB. Vanilla HTML / CSS / JS — no build
 
 ## Run
 
-The BrainDB backend must be running first (default: `http://localhost:8000`). From the repo root:
+Served by the stack itself — `docker compose up -d` includes an nginx container for this directory. Open <http://localhost:8642> (change the port with `FRONTEND_PORT` in `.env`). The backend must be running too (default: `http://localhost:8000`).
+
+No container? Any static file server works. From the repo root:
 
 ```bash
-python -m http.server 8090 -d frontend
+python -m http.server 8642 -d frontend
 ```
 
-Then open <http://localhost:8090>.
-
-That's it. The frontend is a static page that talks to the API directly via `fetch`. CORS is already open on the backend.
-
-> If `8090` is in use on your machine, pick any free port: `python -m http.server <PORT> -d frontend`. (Avoid `8080` on Windows with Docker Desktop installed — it's commonly held by the WSL backend.)
+That's it. The frontend is a static page that talks to the API directly via `fetch`. CORS is already open on the backend. (If you pick your own port, avoid `8080` on Windows with Docker Desktop installed — it's commonly held by the WSL backend.)
 
 ## Pointing at a non-local backend
 
