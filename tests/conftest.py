@@ -54,12 +54,15 @@ def _wait_for_health(url: str, timeout: int = 30) -> bool:
     return False
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def _require_live_api() -> None:
     """Fail fast and loud if the test stack isn't up.
 
-    Deliberately NOT defaulting to the personal stack on :8000 — the suite
-    must never run against a database holding real data.
+    Attached to the `api` fixture (NOT autouse) so pure unit tests — the
+    validator/handoff/chunking files that never touch HTTP — run with no
+    stack at all (that's also what CI runs). Deliberately NOT defaulting
+    to the personal stack on :8000 — the suite must never run against a
+    database holding real data.
     """
     if not _wait_for_health(API_URL):
         pytest.fail(
@@ -72,7 +75,7 @@ def _require_live_api() -> None:
 
 
 @pytest.fixture
-def api() -> str:
+def api(_require_live_api: None) -> str:
     """Base URL for the API — tests append paths like f'{api}/api/v1/...'."""
     return API_URL
 
@@ -86,7 +89,7 @@ def test_tag() -> str:
 
 
 @pytest.fixture
-def created_entities() -> Iterator[list[str]]:
+def created_entities(api: str) -> Iterator[list[str]]:
     """Collector the test appends entity IDs to. Everything in it gets deleted
     at teardown. Ignore 404s (already cleaned up).
     """
@@ -94,7 +97,7 @@ def created_entities() -> Iterator[list[str]]:
     yield ids
     for eid in ids:
         try:
-            requests.delete(f"{API_URL}/api/v1/entities/{eid}", timeout=5)
+            requests.delete(f"{api}/api/v1/entities/{eid}", timeout=5)
         except requests.RequestException:
             pass
 

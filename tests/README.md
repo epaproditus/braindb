@@ -4,6 +4,8 @@ Integration tests that exercise the real HTTP API against a live PostgreSQL and,
 
 The suite runs against an **isolated test stack** — its own API (port 8002) and its own throwaway Postgres (`braindb_test`, host port 5436). It never touches your personal BrainDB database; tearing the stack down wipes all test data.
 
+Pure unit files (`test_split_chunks.py`, `test_wiki_sections.py`, `test_final_answer_rename.py`, `test_handoff_hooks.py`, `test_runhooks_countdown.py`) need **no stack at all** — only tests that talk to the API or database require the test stack to be up.
+
 ## Prerequisites
 
 Start the test stack:
