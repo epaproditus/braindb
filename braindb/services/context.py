@@ -360,7 +360,7 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
                 if eid not in content_scores or r["c"] > content_scores[eid]:
                     content_scores[eid] = r["c"]
                     if req.explain:
-                        content_parts[eid] = {k: r[k] for k in ("ft", "ws", "damper", "c")}
+                        content_parts[eid] = {k: r[k] for k in ("ws", "damper", "c")}
                 if eid not in seed_rows_by_id and eid not in fuzzy_rows \
                         and eid not in embedding_rows and eid not in content_rows:
                     content_rows[eid] = r
@@ -415,23 +415,20 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
     # Filter out keyword entities from results — they're infrastructure, not content
     all_rows = [r for r in seen.values() if r.get("entity_type") != "keyword"]
 
+    ext_map = fetch_ext(conn, all_rows)
+
     # Retired/redirected wikis (consolidation losers) are stubs kept only so
     # old references still resolve — they must never surface as results.
     # Their importance is zeroed on retirement, but that alone doesn't stop
-    # them from occupying result slots; this filter does.
-    wiki_ids = [str(r["id"]) for r in all_rows if r.get("entity_type") == "wiki"]
-    if wiki_ids:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT entity_id FROM wikis_ext WHERE entity_id = ANY(%s::uuid[]) "
-                "AND (retired_at IS NOT NULL OR redirect_to IS NOT NULL)",
-                (wiki_ids,),
-            )
-            retired = {str(r["entity_id"]) for r in cur.fetchall()}
-        if retired:
-            all_rows = [r for r in all_rows if str(r["id"]) not in retired]
+    # them from occupying result slots; this filter does. The flags come
+    # straight from the wiki ext rows fetch_ext already loaded.
+    def _is_retired_wiki(row: dict) -> bool:
+        if row.get("entity_type") != "wiki":
+            return False
+        ext = ext_map.get(row["id"], {})
+        return bool(ext.get("retired_at") or ext.get("redirect_to"))
 
-    ext_map = fetch_ext(conn, all_rows)
+    all_rows = [r for r in all_rows if not _is_retired_wiki(r)]
 
     items = []
     explain_map: dict[str, dict] | None = {} if req.explain else None

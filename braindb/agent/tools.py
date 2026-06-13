@@ -149,13 +149,30 @@ async def recall_memory(
         req = ContextRequest(queries=queries, max_results=max_results)
         with get_conn() as conn:
             result = assemble_context(conn, req)
+        # EVERY item must survive into the rendered output — the per-query
+        # quota guarantees membership, and a blind tail-truncate would undo
+        # that guarantee for low-ranked reserved items (items are sorted by
+        # final_rank, so reserved picks sit at the tail). So: budget the
+        # content preview per item and shrink previews, never drop items.
+        n = max(1, len(result.items))
+        per_item_overhead = 130   # header + id + keywords lines, roughly
+        content_budget = max(
+            150, (MAX_OUTPUT_CHARS - 800) // n - per_item_overhead
+        )
+
+        def _clip(text: str, cap: int) -> str:
+            s = text or ""
+            if len(s) <= cap:
+                return s
+            return s[:cap] + f"...(+{len(s) - cap} chars; get_entity for full)"
+
         lines = [f"Found {result.total_found} items:"]
         for item in result.items:
             lines.append(
                 f"[{item.entity_type}] rank={item.final_rank:.3f} src={item.source or '-'}\n"
                 f"  id: {item.id}\n"
-                f"  content: {item.content}\n"
-                f"  keywords: {', '.join(item.keywords)}"
+                f"  content: {_clip(item.content, content_budget)}\n"
+                f"  keywords: {_clip(', '.join(item.keywords), 120)}"
             )
         for rule in result.always_on_rules:
             lines.append(f"[RULE priority={rule.ext.get('priority')}] {rule.content}")
