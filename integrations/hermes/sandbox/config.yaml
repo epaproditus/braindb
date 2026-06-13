@@ -1,0 +1,29 @@
+# Hermes Agent config for the BrainDB sandbox test (throwaway profile).
+# Copied to ./hermes-data/config.yaml before `docker compose up`.
+#
+# Brain  : deepinfra via a custom OpenAI-compatible endpoint (model >= 64k ctx).
+# Memory : the braindb provider (its braindb_ask / braindb_ingest tools).
+# Safety : every dangerous toolset is STRIPPED below, so the agent can only
+#          reach BrainDB — it cannot run shell, code, the browser, or write files.
+
+model:
+  provider: custom
+  # DeepInfra-hosted, 128k context (well over Hermes' 64k floor) and strong at
+  # tool use. Swap for any >=64k deepinfra model you prefer.
+  default: meta-llama/Llama-3.3-70B-Instruct
+  base_url: https://api.deepinfra.com/v1/openai
+  # API key is read from CUSTOM_API_KEY in ./hermes-data/.env (not hard-coded here).
+
+memory:
+  provider: braindb
+
+agent:
+  # Strip everything that could touch the host or the open internet. The braindb
+  # provider's tools are NOT part of these toolsets, so they remain available.
+  disabled_toolsets:
+    - terminal       # arbitrary shell on the host
+    - execute_code   # arbitrary Python (+ a known terminal-approval bypass, #4146)
+    - browser        # web automation
+    - computer_use   # desktop control
+    - web            # web_search / web_extract (network egress)
+    - file           # write_file / patch (filesystem writes)

@@ -1,0 +1,5 @@
+name: braindb
+version: 1.0.0
+description: "BrainDB — self-hosted memory: natural-language recall/save via its own agent, plus file ingestion. Talks to a running BrainDB over HTTP."
+pip_dependencies:
+  - requests

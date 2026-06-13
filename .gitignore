@@ -61,3 +61,7 @@ data_bench/
 
 # Test stack (docker-compose.test.yml): separate host data dir for test ingests
 data_test/
+
+# Hermes sandbox (integrations/hermes/sandbox): throwaway agent profile dir —
+# holds a .env with the LLM key + provider state; never commit it.
+integrations/hermes/sandbox/hermes-data/
