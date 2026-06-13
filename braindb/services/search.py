@@ -6,6 +6,7 @@ Uses a 4-tier scoring system:
   3. Content trigram similarity    — weight 0.5
   4. Title trigram similarity      — weight 0.3
 """
+import math
 import os
 
 import psycopg2.extras
@@ -84,6 +85,71 @@ _WHERE_EXPR = f"""
         OR similarity(COALESCE(e.title, ''), %s) > 0.2
     )
 """
+
+
+def content_witness(
+    conn,
+    query: str,
+    entity_types: list[str] | None,
+    min_importance: float,
+    limit: int,
+    size_pivot: int,
+) -> list[dict]:
+    """Content evidence for /memory/context: does the entity BODY literally
+    talk about the query? Returns rows with `c` in 0-1, built from two
+    index-backed tiers:
+
+      ft — stemmed full-text match via the search_vector GIN index.
+           ts_rank normalization 33 = length-normalized AND mapped to 0-1
+           (rank/(rank+1)), so no magic scale constants.
+      ws — per-word trigram fuzz via word_similarity(): the best matching
+           WINDOW inside the body (typo-tolerant, length-independent) —
+           NOT whole-document similarity(), which dilutes to ~0 on any
+           long body. The operator form (written `<%%` below only because
+           psycopg2 needs the literal %% escape) is index-assisted by the
+           existing entities_trgm_idx GIN(content gin_trgm_ops).
+
+      c = max(ft, ws) × damper, damper = 1/(1+log10(1+len/size_pivot)) —
+      detection is length-blind (the needle in a huge wiki IS found), the
+      explicit damper then makes big bodies earn their rank.
+
+    Keyword entities are excluded — their content IS the keyword text, and
+    matching it here would just duplicate the keyword pathway.
+    """
+    sql = """
+        SELECT
+            e.id, e.entity_type, e.title, e.content, e.summary,
+            e.keywords, e.importance, e.source, e.notes,
+            e.created_at, e.updated_at, e.accessed_at, e.access_count, e.metadata,
+            ts_rank(e.search_vector, plainto_tsquery('english', %s), 33) AS ft,
+            word_similarity(%s, e.content) AS ws,
+            length(e.content) AS content_len
+        FROM entities e
+        WHERE e.entity_type != 'keyword'
+          AND (
+                e.search_vector @@ plainto_tsquery('english', %s)
+                OR %s <%% e.content
+              )
+          AND e.importance >= %s
+    """
+    params: tuple = (query, query, query, query, min_importance)
+    if entity_types:
+        sql += " AND e.entity_type = ANY(%s)"
+        params += (entity_types,)
+    sql += " ORDER BY GREATEST(ts_rank(e.search_vector, plainto_tsquery('english', %s), 33), word_similarity(%s, e.content)) DESC LIMIT %s"
+    params += (query, query, limit)
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        damper = 1.0 / (1.0 + math.log10(1.0 + r["content_len"] / max(1, size_pivot)))
+        r["damper"] = round(damper, 4)
+        r["ft"] = float(r["ft"] or 0.0)
+        r["ws"] = float(r["ws"] or 0.0)
+        r["c"] = round(max(r["ft"], r["ws"]) * damper, 4)
+        r["content"] = preview(r.get("content"), r.get("id"))
+    return rows
 
 
 def fuzzy_search(conn, query: str, entity_types: list[str] | None, min_importance: float, limit: int) -> list[dict]:

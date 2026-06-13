@@ -21,6 +21,10 @@ class ContextRequest(BaseModel):
     min_relevance: float = Field(default=0.05, ge=0.0, le=1.0)
     include_always_on_rules: bool = True
     min_importance: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Diagnostic only: when true, the response carries a per-entity score
+    # breakdown in ContextResponse.explain. Never set by the agent tools or
+    # the frontend — intended for manual tuning/debugging sessions.
+    explain: bool = False
 
     @model_validator(mode="after")
     def at_least_one_query(self):
@@ -58,3 +62,6 @@ class ContextResponse(BaseModel):
     items: list[SearchResultItem]
     always_on_rules: list[SearchResultItem] = []
     total_found: int
+    # Per-entity score constituents, keyed by entity id (str). Populated only
+    # when ContextRequest.explain=true; null otherwise.
+    explain: dict[str, Any] | None = None
