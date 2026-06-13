@@ -20,6 +20,15 @@ _LLM_PROFILES: dict[str, dict[str, str]] = {
         "model": "deepinfra/google/gemma-4-31B-it",
         "api_key_env": "DEEPINFRA_API_KEY",
     },
+    # Generic OpenAI-compatible /v1 endpoint (Ollama, LM Studio, copilot-api,
+    # vLLM, ...). Unlike the vllm_* profiles, its base_url is NOT fixed here —
+    # set OPENAI_BASE_URL in the env (see Settings.resolved_base_url). The
+    # model has no default: set AGENT_MODEL to your served model with the
+    # openai/ prefix, e.g. AGENT_MODEL=openai/llama3.2:3b.
+    "openai_compatible": {
+        "model": "",
+        "api_key_env": "OPENAI_API_KEY",
+    },
     "vllm_workstation": {
         "model": "openai/cyankiwi/gemma-4-31B-it-AWQ-4bit",
         "api_key_env": "VLLM_API_KEY",
@@ -117,6 +126,10 @@ class Settings(BaseSettings):
     # Agent (LiteLLM — provider selected via llm_profile)
     llm_profile: str = "deepinfra"
     agent_model: str = ""          # blank = use profile's default model
+    # Base URL for the `openai_compatible` profile ONLY (e.g. Ollama on
+    # http://host.docker.internal:11434/v1). Ignored by every other profile —
+    # their base_url stays fixed in _LLM_PROFILES. See resolved_base_url.
+    openai_base_url: str = ""
     # Bumped 15 → 20 after live observation on Qwen 27B AWQ-INT4 (vLLM):
     # deep-research-style runs commonly need >15 tool turns to land
     # `final_answer`. 20 gives breathing room; finishes-fast providers
@@ -188,12 +201,19 @@ class Settings(BaseSettings):
         key = os.getenv(profile["api_key_env"], "")
         # Self-hosted profiles (vLLM/Ollama) may run without auth, but the
         # OpenAI client still needs a non-empty key — supply a placeholder.
-        if not key and profile.get("base_url"):
+        # Uses resolved_base_url so the env-driven openai_compatible profile
+        # is covered too, not just the profiles with a fixed base_url.
+        if not key and self.resolved_base_url:
             return "EMPTY"
         return key
 
     @property
     def resolved_base_url(self) -> str | None:
+        # Only the generic openai_compatible profile takes its base_url from
+        # the environment (OPENAI_BASE_URL). Every other profile's base_url
+        # stays fixed in the _LLM_PROFILES table — no silent global override.
+        if self.llm_profile == "openai_compatible":
+            return self.openai_base_url or None
         return _LLM_PROFILES[self.llm_profile].get("base_url")
 
 
