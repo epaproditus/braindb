@@ -4,6 +4,9 @@ Context assembly:
   2. Graph expand → up to 3 hops
   3. Temporal decay + reinforcement → effective_importance
   4. Final rank = search_score * effective_importance * accumulated_relevance
+     (accumulated_relevance = the per-edge relevance_score × importance_score
+     compounded along the graph path — i.e. accumulated relevance-AND-
+     importance, despite the short field name; 1.0 at the seed.)
   5. Fetch always-on rules
   6. Increment access_count / accessed_at for all returned entities
 """

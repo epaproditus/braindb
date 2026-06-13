@@ -173,9 +173,9 @@ See [BRAINDB_GUIDE.md](BRAINDB_GUIDE.md) for full API reference with curl exampl
 1. **Multi-query search** — pass `queries: ["topic1", "topic2"]` to search multiple angles at once. Each query is matched against keyword entities by both pg_trgm trigram similarity AND query-embedding-vs-keyword-embedding cosine similarity; results are merged with the geometric mean (configurable `missing_signal_penalty` when only one signal fires).
 2. **Per-search-term reservation (L1 diversity quota)** — each query you pass gets a guaranteed share of the result slots filled from THAT query's own top-ranked entities. Bare-keyword queries (`"Petros"`) reliably surface specific facts even when paired with broader semantic angles.
 3. **Per-keyword reservation (L2 diversity quota)** — each dominant matched keyword gets a halving slot allowance (50% / 25% / 12.5% ..., floor 1). Stops one popular hub keyword (e.g. `user-profile` tagging 100 facts) from monopolising top-N.
-4. **Graph traversal** up to 3 hops via relations, relevance fading: `1.0 → 0.6 → 0.3`.
+4. **Graph traversal** up to 3 hops via relations. Each hop multiplies by the edge's `relevance_score × importance_score`; that product (< 1) compounds along the path, so distance fades naturally — weak-edge paths die fast, strong-edge paths persist.
 5. **Temporal decay** — memories fade over time, strengthen on access.
-6. **Final rank** = `combined_score × effective_importance × accumulated_relevance`. The LLM-visible cap stays at the caller's `max_results` (default 30); the scoring pool internally considers up to 500 candidates per query so narrow keywords are never excluded before they're evaluated.
+6. **Final rank** = `combined_score × effective_importance × accumulated_relevance`, where `accumulated_relevance` is that compounded per-hop edge product (relevance × importance along the path; 1.0 for a direct hit). The LLM-visible cap stays at the caller's `max_results` (default 30); the scoring pool internally considers up to 500 candidates per query so narrow keywords are never excluded before they're evaluated.
 7. **Always-on rules** injected regardless of query.
 
 Single `query` (string) still works for backward compatibility.

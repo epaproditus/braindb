@@ -70,9 +70,9 @@ def test_importance_score_moves_per_hop_relevance(api, make_fact):
     lo_rel = by_id[lo_target["id"]]["relevance"]
 
     # Both reached via the same one-hop path; only importance_score differs.
-    # With the fix in graph.py the per-hop multiplier multiplies by
-    # COALESCE(r.importance_score, 0.5), so hi (imp 0.9) > lo (imp 0.2).
-    # Per-hop math: 1.0 * 0.7 * imp * depth_penalty(1.0)
+    # The per-hop multiplier multiplies by COALESCE(r.importance_score, 0.5),
+    # so hi (imp 0.9) > lo (imp 0.2).
+    # Per-hop math: accumulated(1.0) * relevance_score(0.7) * importance_score
     assert hi_rel > lo_rel, (
         f"importance_score does not move per-hop relevance: "
         f"hi={hi_rel:.4f} lo={lo_rel:.4f}"

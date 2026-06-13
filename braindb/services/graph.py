@@ -31,15 +31,15 @@ WITH RECURSIVE traversal AS (
         target.keywords, target.importance, target.source, target.notes,
         target.created_at, target.updated_at, target.accessed_at, target.access_count, target.metadata,
         t.depth + 1,
+        -- accumulated_relevance compounds BOTH per-edge weights
+        -- (relevance_score × importance_score) along the path. That
+        -- product is < 1 per hop, so it IS the natural distance fade —
+        -- a path of weak edges dies fast, a path of strong edges
+        -- decays slowly. No separate depth penalty needed.
         (
             t.accumulated_relevance
             * r.relevance_score
             * COALESCE(r.importance_score, 0.5)
-            * CASE t.depth + 1
-                WHEN 1 THEN 1.0
-                WHEN 2 THEN 0.8
-                ELSE        0.6
-              END
         )::FLOAT,
         t.visited || target.id,
         r.id,
@@ -60,7 +60,6 @@ WITH RECURSIVE traversal AS (
             t.accumulated_relevance
             * r.relevance_score
             * COALESCE(r.importance_score, 0.5)
-            * CASE t.depth + 1 WHEN 1 THEN 1.0 WHEN 2 THEN 0.8 ELSE 0.6 END
           ) > %s
 )
 SELECT DISTINCT ON (id)
