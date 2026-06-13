@@ -22,6 +22,9 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       LLM_PROFILE: ${LLM_PROFILE:-deepinfra}
       AGENT_MODEL: ${AGENT_MODEL:-}
+      # OpenAI-compatible profile (Ollama / LM Studio / copilot-api / vLLM):
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       NVIDIA_NIM_API_KEY: ${NVIDIA_NIM_API_KEY:-}
       DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:-}
       VLLM_API_KEY: ${VLLM_API_KEY:-}

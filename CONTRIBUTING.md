@@ -59,7 +59,9 @@ No other code changes required — the agent resolves model and key through `set
 
 ### Self-hosted OpenAI-compatible servers (vLLM, Ollama, llama.cpp)
 
-For a server you run yourself that speaks the OpenAI REST shape, the profile takes an optional third field, `base_url`, and uses LiteLLM's `openai/` prefix to route through the OpenAI-compatible code path:
+If you just want to point at *any* OpenAI-compatible `/v1` endpoint without touching code, use the built-in **`openai_compatible`** profile: set `LLM_PROFILE=openai_compatible`, `AGENT_MODEL=openai/<model-id>`, and `OPENAI_BASE_URL` in your `.env` (plus `OPENAI_API_KEY` if the server needs auth). It takes its base URL from the environment — uniquely; every other profile's `base_url` is fixed in the table below.
+
+To **bake in** a recurring self-hosted target as its own named profile instead, add a `base_url` field to the entry and use LiteLLM's `openai/` prefix to route through the OpenAI-compatible code path:
 
 ```python
 "vllm_workstation": {

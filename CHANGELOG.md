@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`openai_compatible` LLM profile.** Point the internal agent at any
+  OpenAI-compatible `/v1` endpoint (Ollama, LM Studio, copilot-api, a remote
+  vLLM) without adding a provider abstraction: set
+  `LLM_PROFILE=openai_compatible`, `AGENT_MODEL=openai/<model-id>`, and
+  `OPENAI_BASE_URL` (plus `OPENAI_API_KEY` only if the server requires auth).
+  The env-driven base URL is scoped to this profile alone — every other
+  profile's `base_url` stays fixed in the table, so nothing is silently
+  re-pointed. Based on @WarGloom's proposal in #7, reworked to the
+  provider-prefix env convention and a profile-scoped override.
+
 ### Changed
 
 - **`/memory/context` ranking — full-content signal + cleaner graph fade.**
