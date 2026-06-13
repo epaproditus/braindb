@@ -1,13 +1,14 @@
-# Hermes Agent sandbox — runs Hermes in a HARDENED, TOOL-STRIPPED container and
-# joins it to BrainDB's docker network so it reaches the API at
-# http://braindb_api:8000. Hermes' shell / code-exec / browser / file tools are
-# disabled in config.yaml (see ./hermes-data/config.yaml) so it can ONLY use the
-# braindb_* memory tools.
+# Hermes Agent sandbox — runs Hermes in a TOOL-STRIPPED container (see
+# ./hermes-data/config.yaml: agent.disabled_toolsets) joined to BrainDB's docker
+# network so it reaches the API at http://braindb_api:8000.
 #
-# Intended for an ISOLATED, THROWAWAY host (the Raspberry Pi) — NOT a work laptop.
-# Bring BrainDB up FIRST (its own compose, COMPOSE_PROFILES=internal-db +
-# LLM_PROFILE=deepinfra), then this. See README.md.
-
+# For an ISOLATED, THROWAWAY host (a Raspberry Pi) — NOT a work laptop. The host
+# isolation + the tool-stripping ARE the security boundary. We do NOT cap_drop:
+# the image's s6-overlay init needs CHOWN/SETUID/SETGID to set up its own
+# unprivileged user and /opt/data (matches the official Hermes compose); instead
+# we run as a non-root UID.
+#
+# Bring BrainDB up first (its own compose, COMPOSE_PROFILES=internal-db), then this.
 services:
   hermes:
     image: nousresearch/hermes-agent:latest   # multi-arch (incl. arm64 for the Pi)
@@ -16,28 +17,13 @@ services:
     networks:
       - local-network
     environment:
-      # The braindb memory provider reads this. braindb_api is BrainDB's
-      # container on local-network (its api listens on 8000).
-      BRAINDB_BASE_URL: http://braindb_api:8000
-      # Hermes' OWN brain — deepinfra via the custom OpenAI-compatible provider.
-      # Key set in ./hermes-data/.env (CUSTOM_API_KEY); mirrored here for safety.
-      CUSTOM_API_KEY: ${CUSTOM_API_KEY:-}
+      BRAINDB_BASE_URL: http://braindb_api:8000   # the braindb memory provider reads this
+      HERMES_UID: "1000"                          # run as the host user that owns ./hermes-data
+      HERMES_GID: "1000"
     volumes:
-      # Throwaway profile dir (/opt/data == ~/.hermes inside the image): holds
-      # config.yaml, .env and state. NOT a real ~/.hermes.
-      - ./hermes-data:/opt/data
-      # The BrainDB memory-provider plugin (read-only), from the sibling folder.
-      - ../braindb:/opt/data/plugins/memory/braindb:ro
-    # Hermes itself needs no host capabilities — drop them all (defense in depth
-    # on top of the tool-stripping; the real isolation is the throwaway Pi host).
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    # Keeps the agent process alive; interact with:
-    #   docker exec -it hermes_test hermes chat
+      - ./hermes-data:/opt/data                   # throwaway profile (config.yaml with your model + key)
+      - ../braindb:/opt/data/plugins/braindb:ro   # the BrainDB plugin (FLAT user-plugin path: plugins/<name>/)
     command: gateway run
-
 networks:
   # BrainDB already declares this as an external network; we join the same one.
   local-network:

@@ -10,10 +10,10 @@ full toolset.
 
 ## Install
 
-**Option A — drop-in folder**
+**Option A — drop-in folder** (user plugins live FLAT under `plugins/<name>/`)
 
 ```bash
-cp -r braindb ~/.hermes/plugins/memory/braindb
+cp -r braindb ~/.hermes/plugins/braindb
 ```
 
 **Option B — pip** (if packaged): `pip install hermes-plugins-braindb`.

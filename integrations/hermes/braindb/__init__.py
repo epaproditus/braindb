@@ -1,8 +1,8 @@
 """
 BrainDB memory provider for Hermes Agent (https://github.com/NousResearch/hermes-agent).
 
-Install: drop this `braindb/` folder into `~/.hermes/plugins/memory/braindb/`
-(or pip-install it), then `hermes memory setup` and pick "braindb".
+Install: drop this `braindb/` folder into `~/.hermes/plugins/braindb/` (user
+plugins live FLAT under plugins/<name>/), then `hermes memory setup` -> "braindb".
 
 Design (deliberately small):
 - AGENT-ONLY gateway. `braindb_ask` forwards a natural-language request to
