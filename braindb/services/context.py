@@ -4,6 +4,9 @@ Context assembly:
   2. Graph expand → up to 3 hops
   3. Temporal decay + reinforcement → effective_importance
   4. Final rank = search_score * effective_importance * accumulated_relevance
+     (accumulated_relevance = the per-edge relevance_score × importance_score
+     compounded along the graph path — i.e. accumulated relevance-AND-
+     importance, despite the short field name; 1.0 at the seed.)
   5. Fetch always-on rules
   6. Increment access_count / accessed_at for all returned entities
 """
@@ -22,7 +25,7 @@ from braindb.services.keyword_service import (
     find_fuzzy_keywords,
     find_similar_keywords,
 )
-from braindb.services.search import fuzzy_search, preview
+from braindb.services.search import content_witness, preview
 
 DECAY_RATES = {
     "thought":    settings.decay_rate_thought,
@@ -147,6 +150,7 @@ def _apply_two_level_quota(
     max_results: int,
     per_query_share: float,
     halving: float,
+    placement: dict | None = None,
 ) -> list:
     """Re-rank `items` (sorted by `final_rank` desc) under two
     complementary diversity quotas. Both run in ONE pass so they can
@@ -226,12 +230,13 @@ def _apply_two_level_quota(
     # `per_query_top_ids[q_index]` is already sorted by THIS query's
     # combined score, so we get the best-for-this-angle items first.
     if per_query_share > 0:
-        for q_top in per_query_top_ids:
+        for q_idx, q_top in enumerate(per_query_top_ids):
             for eid in q_top:
                 item = by_id.get(eid)
                 if item is None:
                     continue
-                _consume(item)
+                if _consume(item) and placement is not None:
+                    placement[str(item.id)] = f"L1-reserved(q{q_idx})"
                 if len(out) >= max_results:
                     return out
 
@@ -242,7 +247,8 @@ def _apply_two_level_quota(
     for item in items:
         if len(out) >= max_results:
             break
-        _consume(item)
+        if _consume(item) and placement is not None and str(item.id) not in placement:
+            placement[str(item.id)] = "L2-open"
     return out
 
 
@@ -292,27 +298,8 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
                             fuzzy_rows[eid] = ent
         text_scores_by_q.append(per_q_scores)
 
-    # Discoverability backup — entities whose content matches the query
-    # directly but aren't tagged with a matching keyword. Heavy discount
-    # (`DISCOVERY_DISCOUNT`) keeps them weakly-ranked. Pure fallback: only
-    # set text_scores for an entity if the keyword-mediated path didn't
-    # already cover it (never override a real keyword match).
-    DISCOVERY_DISCOUNT = 0.2
-    for q in query_list:
-        rows = fuzzy_search(
-            conn, q, req.entity_types, req.min_importance,
-            limit=settings.scoring_pool_fuzzy,
-        )
-        for r in rows:
-            eid = r["id"]
-            if eid in text_scores:
-                continue   # keyword path already scored this entity; do not override
-            text_scores[eid] = r["score"] * DISCOVERY_DISCOUNT
-            if eid not in seed_rows_by_id and eid not in fuzzy_rows:
-                fuzzy_rows[eid] = r
-
     # ------------------------------------------------------------------ #
-    # 2. KEYWORD EMBEDDING SEARCH (new) — semantic via keyword vectors    #
+    # 2. KEYWORD EMBEDDING SEARCH — semantic via keyword vectors          #
     # ------------------------------------------------------------------ #
     embedding_scores: dict = {}  # entity_id → best keyword similarity (max across queries)
     embedding_dom_kw: dict = {}  # entity_id → keyword_id that yielded the embedding_scores max
@@ -353,26 +340,64 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
         embedding_scores_by_q = [{} for _ in query_list]
 
     # ------------------------------------------------------------------ #
-    # 3. MERGE — geometric mean when both, penalty when single signal     #
+    # 2b. CONTENT WITNESS — does the entity BODY literally talk about     #
+    #     the query? Index-backed (tsvector + word-trigram), size-damped, #
+    #     0-1. Joins the seed equation as an ADDITIVE boost-only term     #
+    #     (w × c): it can reinforce an entity the keyword paths found,    #
+    #     or introduce one they missed — it never lowers anything, and    #
+    #     its absence costs nothing (the semantic path is never punished  #
+    #     for an entity not containing the literal words).                #
     # ------------------------------------------------------------------ #
-    all_entity_ids = set(text_scores.keys()) | set(embedding_scores.keys())
+    content_w = settings.content_weight
+    content_scores: dict = {}   # eid → best c across queries (0-1)
+    content_parts: dict = {}    # eid → {ft, ws, damper, c} (explain only)
+    content_rows: dict = {}     # eid → row data (entities found only via content)
+    if content_w > 0:
+        for q in query_list:
+            for r in content_witness(
+                conn, q, req.entity_types, req.min_importance,
+                limit=settings.scoring_pool_fuzzy,
+                size_pivot=settings.content_size_pivot,
+            ):
+                eid = r["id"]
+                if eid not in content_scores or r["c"] > content_scores[eid]:
+                    content_scores[eid] = r["c"]
+                    if req.explain:
+                        content_parts[eid] = {k: r[k] for k in ("ws", "damper", "c")}
+                if eid not in seed_rows_by_id and eid not in fuzzy_rows \
+                        and eid not in embedding_rows and eid not in content_rows:
+                    content_rows[eid] = r
+
+    # ------------------------------------------------------------------ #
+    # 3. MERGE — one equation, no fallbacks:                              #
+    #    seed = keyword_part + content_weight × c                         #
+    #    keyword_part: geometric mean when both keyword witnesses agree,  #
+    #    single witness × missing_signal_penalty otherwise (unchanged).   #
+    # ------------------------------------------------------------------ #
+    all_entity_ids = set(text_scores.keys()) | set(embedding_scores.keys()) | set(content_scores.keys())
     seed_scores: dict = {}
     penalty = settings.missing_signal_penalty
     for eid in all_entity_ids:
         text_s = text_scores.get(eid)
         emb_s = embedding_scores.get(eid)
         if text_s and emb_s:
-            seed_scores[eid] = math.sqrt(text_s * emb_s)  # geometric mean — both agree
+            kw_part = math.sqrt(text_s * emb_s)  # geometric mean — both agree
         elif text_s:
-            seed_scores[eid] = text_s * penalty            # text only — penalized
+            kw_part = text_s * penalty            # text only — penalized
         elif emb_s:
-            seed_scores[eid] = emb_s * penalty             # embedding only — penalized
-        # Ensure we have row data for entities that came in via either
-        # of the two keyword-mediated pathways.
+            kw_part = emb_s * penalty             # embedding only — penalized
+        else:
+            kw_part = 0.0                         # content-only entity
+        score = kw_part + content_w * content_scores.get(eid, 0.0)
+        if score > 0:
+            seed_scores[eid] = score
+        # Ensure we have row data for entities that came in via any pathway.
         if eid not in seed_rows_by_id and eid in fuzzy_rows:
             seed_rows_by_id[eid] = fuzzy_rows[eid]
         if eid not in seed_rows_by_id and eid in embedding_rows:
             seed_rows_by_id[eid] = embedding_rows[eid]
+        if eid not in seed_rows_by_id and eid in content_rows:
+            seed_rows_by_id[eid] = content_rows[eid]
 
     # ------------------------------------------------------------------ #
     # 4. GRAPH EXPAND + RANK (existing pipeline)                          #
@@ -392,9 +417,24 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
 
     # Filter out keyword entities from results — they're infrastructure, not content
     all_rows = [r for r in seen.values() if r.get("entity_type") != "keyword"]
+
     ext_map = fetch_ext(conn, all_rows)
 
+    # Retired/redirected wikis (consolidation losers) are stubs kept only so
+    # old references still resolve — they must never surface as results.
+    # Their importance is zeroed on retirement, but that alone doesn't stop
+    # them from occupying result slots; this filter does. The flags come
+    # straight from the wiki ext rows fetch_ext already loaded.
+    def _is_retired_wiki(row: dict) -> bool:
+        if row.get("entity_type") != "wiki":
+            return False
+        ext = ext_map.get(row["id"], {})
+        return bool(ext.get("retired_at") or ext.get("redirect_to"))
+
+    all_rows = [r for r in all_rows if not _is_retired_wiki(r)]
+
     items = []
+    explain_map: dict[str, dict] | None = {} if req.explain else None
     for row in all_rows:
         eid = row["id"]
         # Score = the entity's own similarity if it was a seed; otherwise inherit
@@ -402,12 +442,58 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
         # through the graph CTE). This propagates the real similarity signal
         # through depth-1+ hops instead of resetting to a literal fallback.
         score = seed_scores.get(eid)
-        if score is None:
+        if score is not None:
+            score_src = "seed"
+        else:
             origin = row.get("seed_origin_id")
-            score = seed_scores.get(str(origin), 1.0) if origin else 1.0
+            if origin is not None and str(origin) in seed_scores:
+                score = seed_scores[str(origin)]
+                score_src = f"inherited({origin})"
+            else:
+                # No seed signal and no traceable origin: honest zero, not a
+                # free ride. (Used to be a literal 1.0 — higher than any real
+                # match could score.)
+                score = 0.0
+                score_src = "no_seed_signal"
         depth = row.get("min_depth", 0)
         relevance = row.get("relevance", 1.0)
-        items.append(_to_item(row, score, depth, relevance, ext_map.get(eid, {})))
+        it = _to_item(row, score, depth, relevance, ext_map.get(eid, {}))
+        items.append(it)
+        if explain_map is not None:
+            t_s = text_scores.get(eid)
+            e_s = embedding_scores.get(eid)
+            if t_s and e_s:
+                merge = "geometric_mean(both keyword signals)"
+            elif t_s or e_s:
+                merge = f"single_keyword_signal x penalty({penalty})"
+            else:
+                merge = "content_only" if eid in content_scores else None
+            rate = DECAY_RATES.get(row["entity_type"], 0.003)
+            created = row["created_at"]
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            age_days = max(0, (datetime.now(UTC) - created).days)
+            explain_map[str(eid)] = {
+                "fuzzy_keyword_sim": t_s,
+                "fuzzy_keyword_id": text_dom_kw.get(eid),
+                "embedding_keyword_sim": e_s,
+                "embedding_keyword_id": embedding_dom_kw.get(eid),
+                "content_c": content_scores.get(eid),
+                "content_parts": content_parts.get(eid),
+                "content_contribution": round(content_w * content_scores.get(eid, 0.0), 4),
+                "merge": merge,
+                "seed_score": seed_scores.get(eid),
+                "score_source": score_src,
+                "search_score": score,
+                "depth": depth,
+                "accumulated_relevance": relevance,
+                "importance": row["importance"],
+                "age_days": age_days,
+                "decay_factor": round(math.exp(-rate * age_days), 4),
+                "reinforce_factor": round(1.0 + 0.05 * math.log(1 + row.get("access_count", 0)), 4),
+                "effective_importance": round(it.effective_importance, 4),
+                "final_rank": round(it.final_rank, 4),
+            }
 
     items.sort(key=lambda x: x.final_rank, reverse=True)
 
@@ -424,6 +510,11 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
             dominant_kw_by_id[str(eid)] = embedding_dom_kw[eid]
         elif eid in text_dom_kw:
             dominant_kw_by_id[str(eid)] = text_dom_kw[eid]
+        elif eid in content_scores:
+            # Content-only entities share ONE quota bucket — the content
+            # signal is a citizen of the diversity system, not exempt from
+            # it. It can never flood the result past its halving allowance.
+            dominant_kw_by_id[str(eid)] = "__content__"
 
     # `per_query_top_ids`: each query's top-K entities by THAT query's
     # own combined score (geometric-mean merge of text + embedding per
@@ -441,6 +532,21 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
     )
     per_query_top_ids: list[list[str]] = []
     if per_q_reserved > 0 and settings.per_query_share > 0:
+        # Value-aware reservation: rank each query's candidates by match
+        # score × effective_importance, not raw match score alone. A loud
+        # match on a worthless entity must not claim a reserved slot ahead
+        # of a solid match on a valuable one.
+        rows_by_str = {str(k): v for k, v in seed_rows_by_id.items()}
+
+        def _eff_of(eid: str) -> float:
+            row = rows_by_str.get(eid)
+            if row is None:
+                return 1.0
+            return effective_importance(
+                row["importance"], row["created_at"],
+                row.get("access_count", 0), row["entity_type"],
+            )
+
         for q_idx in range(nq):
             t_q = text_scores_by_q[q_idx] if q_idx < len(text_scores_by_q) else {}
             e_q = embedding_scores_by_q[q_idx] if q_idx < len(embedding_scores_by_q) else {}
@@ -456,9 +562,12 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
                     per_q_seed[eid] = t * penalty
                 elif e:
                     per_q_seed[eid] = e * penalty
-            ordered = sorted(per_q_seed.items(), key=lambda kv: -kv[1])[:per_q_reserved]
+            ordered = sorted(
+                per_q_seed.items(), key=lambda kv: -(kv[1] * _eff_of(kv[0]))
+            )[:per_q_reserved]
             per_query_top_ids.append([eid for eid, _ in ordered])
 
+    quota_placement: dict = {}
     items = _apply_two_level_quota(
         items,
         dominant_kw_by_id,
@@ -466,7 +575,41 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
         req.max_results,
         per_query_share=settings.per_query_share,
         halving=settings.keyword_quota_halving,
+        placement=quota_placement if req.explain else None,
     )
+
+    # The quota decides WHICH items make the cut; true rank decides the
+    # ORDER the caller reads them in. Without this, the output is sequenced
+    # by reservation phase and a weak reserved item can sit above the
+    # strongest match in the whole result.
+    items.sort(key=lambda it: it.final_rank, reverse=True)
+
+    # Explain post-pass: keep entries only for entities that made the final
+    # result, resolve winning-keyword ids to their text, attach quota phase.
+    if explain_map is not None:
+        kw_ids = {
+            str(v[k]) for v in explain_map.values()
+            for k in ("fuzzy_keyword_id", "embedding_keyword_id") if v[k]
+        }
+        kw_names: dict[str, str] = {}
+        if kw_ids:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, content FROM entities WHERE id = ANY(%s::uuid[])",
+                    (list(kw_ids),),
+                )
+                kw_names = {str(r["id"]): r["content"] for r in cur.fetchall()}
+        final_ids = {str(it.id) for it in items}
+        for k in list(explain_map.keys()):
+            if k not in final_ids:
+                del explain_map[k]
+                continue
+            e = explain_map[k]
+            fk = e.pop("fuzzy_keyword_id")
+            ek = e.pop("embedding_keyword_id")
+            e["fuzzy_keyword"] = kw_names.get(str(fk)) if fk else None
+            e["embedding_keyword"] = kw_names.get(str(ek)) if ek else None
+            e["quota_placement"] = quota_placement.get(k)
 
     always_on = []
     if req.include_always_on_rules:
@@ -484,4 +627,5 @@ def assemble_context(conn, req: ContextRequest) -> ContextResponse:
         items=items,
         always_on_rules=always_on,
         total_found=len(items),
+        explain=explain_map,
     )

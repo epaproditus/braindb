@@ -60,6 +60,18 @@ class Settings(BaseSettings):
     # Scoring
     missing_signal_penalty: float = 0.5   # multiplier when only text OR only embedding matches (0-1)
 
+    # Content witness — the `w` in `seed = keyword_score + w * c`, where `c`
+    # (0-1) measures whether the entity BODY literally talks about the query
+    # (stemmed full-text + per-word trigram fuzz, both index-backed). The
+    # term is additive and boost-only: it can reinforce or introduce an
+    # entity, never lower one. 0.0 disables the signal entirely (pure
+    # keyword-mediated behavior).
+    content_weight: float = 0.3
+    # Size damper for the content witness: body-derived evidence is scaled by
+    # 1 / (1 + log10(1 + chars/pivot)) — a big document must match BETTER
+    # than a short fact to earn the same c. Bigger pivot = gentler damping.
+    content_size_pivot: int = 2000
+
     # Scoring-pool caps. These bound the CANDIDATE pool that feeds ranking
     # (pure SQL/vector work — cheap, runs once per query). They are NOT the
     # LLM-visible cap; the caller's `max_results` truncates the FINAL sorted

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`/memory/context` ranking — full-content signal + cleaner graph fade.**
+  Retrieval is still keyword-mediated (fuzzy + embedding over keyword
+  entities), but an entity's BODY now contributes a fair, additive signal:
+  `seed = keyword_score + content_weight × c`, where `c` (0–1) is a
+  body-only match (index-backed stemmed full-text + per-word
+  `word_similarity`, with a size damper so long documents must match
+  better). It can reinforce a keyword hit or surface a keyword-missed one,
+  never lower a score; `content_weight=0` reproduces the old keyword-only
+  behavior. This replaces a hard-coded 0.2 "discovery" fallback that
+  double-penalized and discarded agreement. Retired/redirected wiki stubs
+  are now excluded from results; the per-query reservation is
+  importance-aware; and the final list is ordered by true rank. Graph
+  hops now fade purely by the compounding per-edge `relevance × importance`
+  product (the redundant 1.0/0.8/0.6 depth layer was removed). No public
+  response field renamed.
+
 ### Fixed
 
 - **Unit tests no longer demand the test stack.** The live-API guard in
