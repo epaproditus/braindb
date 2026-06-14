@@ -1,0 +1,30 @@
+# Hermes Agent sandbox — runs Hermes in a TOOL-STRIPPED container (see
+# ./hermes-data/config.yaml: agent.disabled_toolsets) joined to BrainDB's docker
+# network so it reaches the API at http://braindb_api:8000.
+#
+# For an ISOLATED, THROWAWAY host (a Raspberry Pi) — NOT a work laptop. The host
+# isolation + the tool-stripping ARE the security boundary. We do NOT cap_drop:
+# the image's s6-overlay init needs CHOWN/SETUID/SETGID to set up its own
+# unprivileged user and /opt/data (matches the official Hermes compose); instead
+# we run as a non-root UID.
+#
+# Bring BrainDB up first (its own compose, COMPOSE_PROFILES=internal-db), then this.
+services:
+  hermes:
+    image: nousresearch/hermes-agent:latest   # multi-arch (incl. arm64 for the Pi)
+    container_name: hermes_test
+    restart: unless-stopped
+    networks:
+      - local-network
+    environment:
+      BRAINDB_BASE_URL: http://braindb_api:8000   # the braindb memory provider reads this
+      HERMES_UID: "1000"                          # run as the host user that owns ./hermes-data
+      HERMES_GID: "1000"
+    volumes:
+      - ./hermes-data:/opt/data                   # throwaway profile (config.yaml with your model + key)
+      - ../braindb:/opt/data/plugins/braindb:ro   # the BrainDB plugin (FLAT user-plugin path: plugins/<name>/)
+    command: gateway run
+networks:
+  # BrainDB already declares this as an external network; we join the same one.
+  local-network:
+    external: true

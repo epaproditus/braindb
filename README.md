@@ -296,6 +296,10 @@ If you'd rather have BrainDB always running (even before any skill is invoked), 
 
 Replace `/ABSOLUTE/PATH/TO/braindb` with your repo path. The hook is async (non-blocking).
 
+## Integrations
+
+Use BrainDB as the memory backend for other agents. **Hermes Agent** (Nous Research) has a ready-made provider in [`integrations/hermes/`](integrations/hermes/): a native memory-provider plugin ([`braindb/`](integrations/hermes/braindb/)) that gives the agent a `braindb_ask` gateway plus a `braindb_ingest` tool, and a hardened, tool-stripped Docker sandbox ([`sandbox/`](integrations/hermes/sandbox/)) for safely trying it on a throwaway host. Each folder's README has the setup.
+
 ## File Ingestion
 
 Drop a file in `data/sources/` — the always-on watcher sidecar picks it up within 7s, ingests it, and runs a chunked fact-extraction pipeline that saves atomic facts into the knowledge graph linked back to the source via `derived_from` relations. Processed files move to `data/sources/ingested/`, failures to `data/sources/failed/` with an `.error.txt` sidecar.
