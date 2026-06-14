@@ -10,13 +10,12 @@ full toolset.
 
 ## Install
 
-**Option A — drop-in folder** (user plugins live FLAT under `plugins/<name>/`)
+Hermes discovers memory providers as folders under `~/.hermes/plugins/`. Copy this
+plugin folder there (user plugins live FLAT under `plugins/<name>/`):
 
 ```bash
-cp -r braindb ~/.hermes/plugins/braindb
+cp -r integrations/hermes/braindb ~/.hermes/plugins/braindb
 ```
-
-**Option B — pip** (if packaged): `pip install hermes-plugins-braindb`.
 
 Then activate it:
 
