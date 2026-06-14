@@ -72,7 +72,7 @@ braindb/
 │   ├── config.py                      # Settings (decay rates, graph params, agent config)
 │   ├── db.py                          # get_conn() — one psycopg2 connection per request
 │   ├── ingest_watcher.py              # Always-on sidecar: polls data/sources/, triggers agent
-│   ├── routers/                       # entities.py, relations.py, memory.py, agent.py
+│   ├── routers/                       # entities.py, relations.py, memory.py, agent.py, wiki.py, integrations.py
 │   ├── schemas/                       # Pydantic models (entities, relations, search)
 │   ├── services/                      # search.py, graph.py, context.py, embedding_service.py,
 │   │                                  # keyword_service.py, activity_log.py
@@ -88,6 +88,7 @@ braindb/
 │   ├── braindb/SKILL.md               # Direct curl-based skill
 │   └── braindb-agent/SKILL.md         # Thin wrapper around the agent endpoint
 ├── frontend/                          # Read-only browser UI — vanilla JS, no build (served at :8642)
+├── integrations/hermes/               # BrainDB-as-memory for Hermes Agent (provider plugin + test sandbox)
 ├── docker-compose.yml                 # api + watcher + wiki_scheduler + frontend (+ optional bundled Postgres)
 ├── .env                               # Real credentials — DO NOT COMMIT
 └── BRAINDB_GUIDE.md                   # Full API reference with curl examples
