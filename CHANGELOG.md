@@ -5,10 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] — 2026-06-14
+
+Headline: BrainDB becomes a native long-term-memory backend for **Hermes Agent**
+(Nous Research) — a small `MemoryProvider` plugin that exposes the whole of BrainDB
+to a Hermes agent through one gateway tool, plus a file-ingest tool. Also in this
+release: a fairer body-content signal in `/memory/context` recall, the
+`openai_compatible` LLM profile, and a unit-test isolation fix.
 
 ### Added
 
+- **Hermes Agent memory provider.** A native [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+  `MemoryProvider` plugin (`integrations/hermes/braindb/`) lets a Hermes agent use a
+  self-hosted BrainDB as long-term memory through two tools: `braindb_ask` (one gateway
+  to all of BrainDB — recall / save / relate / reason via BrainDB's own internal agent)
+  and `braindb_ingest` (upload a local file for the watcher to fact-extract). Agent usage
+  instructions load live from BrainDB's `/skill` endpoint, so there is no copied prompt to
+  maintain. Backed by two additive, isolated endpoints in a new
+  `braindb/routers/integrations.py` — `GET /api/v1/skill/{name}` and
+  `POST /api/v1/entities/datasources/upload` — that change no existing route, schema, or
+  behaviour. Ships with a tool-stripped Docker sandbox (`integrations/hermes/sandbox/`)
+  for trying it on a throwaway host; verified end-to-end on an isolated Raspberry Pi.
+  Install: copy the plugin folder into `~/.hermes/plugins/braindb`, then
+  `hermes memory setup`. (#17)
 - **`openai_compatible` LLM profile.** Point the internal agent at any
   OpenAI-compatible `/v1` endpoint (Ollama, LM Studio, copilot-api, a remote
   vLLM) without adding a provider abstraction: set
@@ -17,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The env-driven base URL is scoped to this profile alone — every other
   profile's `base_url` stays fixed in the table, so nothing is silently
   re-pointed. Based on @WarGloom's proposal in #7, reworked to the
-  provider-prefix env convention and a profile-scoped override.
+  provider-prefix env convention and a profile-scoped override. (#16)
 
 ### Changed
 
