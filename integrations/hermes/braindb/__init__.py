@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "http://localhost:8000"
 _SKILL_NAME = "braindb-agent"
-_ASK_TIMEOUT = 90      # /agent/query runs an LLM loop — allow headroom
+_ASK_TIMEOUT = int(os.environ.get("BRAINDB_ASK_TIMEOUT", "600"))  # /agent/query LLM loop; override via env
 _HTTP_TIMEOUT = 15     # skill fetch / file upload
 _HEALTH_TIMEOUT = 2    # readiness ping
 

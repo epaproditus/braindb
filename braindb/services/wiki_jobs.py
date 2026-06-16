@@ -52,6 +52,22 @@ ASSIGNED_LEASE_MIN = int(os.getenv("WIKI_ASSIGNED_LEASE_MIN", "20"))
 # that wiki on each fire.
 ATTACH_COOLDOWN_SEC = int(os.getenv("WIKI_ATTACH_COOLDOWN_SECONDS", "300"))
 
+# Batched triage (clustering). When the maintainer runs, let it CLAIM several
+# related triage jobs at once — orphan keywords that share ONE source fact (plus
+# that fact's own job when the fact is also an orphan) — and decide them in a
+# single LLM call. This changes only how the maintainer GROUPS its claim; it
+# never touches run_cron, the per-job lifecycle, or the decision logic (each job
+# still closes with its own status). Same os.getenv pattern as the knobs above
+# (config-import free). Default on; the A/B harness flips it per run.
+WIKI_TRIAGE_CLUSTER = os.getenv("WIKI_TRIAGE_CLUSTER", "true").lower() == "true"
+# Max seeds (the shared source fact + its orphan keywords) decided in one
+# maintainer call — caps prompt size and keeps the model focused; extras are
+# left for a later claim.
+WIKI_TRIAGE_CLUSTER_MAX = int(os.getenv("WIKI_TRIAGE_CLUSTER_MAX", "8"))
+# A keyword tagged on >= this many entities is a hub (it spans many distinct
+# subjects, e.g. "CityFalcon") — triaged alone, never used to pull in a cluster.
+WIKI_TRIAGE_HUB_DEGREE = int(os.getenv("WIKI_TRIAGE_HUB_DEGREE", "9"))
+
 
 def _claimable(alias: str = "") -> str:
     """SQL predicate: a job is claimable if pending, OR assigned but its
@@ -283,6 +299,78 @@ def claim_one_triage(conn) -> dict | None:
         )
         row = cur.fetchone()
         return dict(row) if row else None
+
+
+def claim_related_triage(conn, primary_entity_id: str, exclude_job_id: str,
+                         limit: int) -> list[dict]:
+    """
+    Claim up to `limit` other claimable triage jobs whose entity shares a source
+    fact with `primary_entity_id` — its non-hub sibling keywords (tagged on the
+    same fact) and the source fact(s)' own jobs — so a fact and its keywords are
+    decided in ONE maintainer call. `FOR UPDATE SKIP LOCKED`, importance first.
+    Each returned job is still single-entity and is closed individually by the
+    caller (per-job lifecycle unchanged). Returns [] if `limit` <= 0 or the
+    primary is itself a hub (a hub spans many subjects, so it is triaged alone).
+    """
+    if limit <= 0:
+        return []
+    pid = str(primary_entity_id)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # A hub primary would group too many unrelated subjects → triage it alone.
+        cur.execute(
+            "SELECT count(*) AS c FROM relations "
+            "WHERE relation_type='tagged_with' AND (from_entity_id=%s OR to_entity_id=%s)",
+            (pid, pid),
+        )
+        if cur.fetchone()["c"] >= WIKI_TRIAGE_HUB_DEGREE:
+            return []
+        cur.execute(
+            f"""
+            WITH src AS (
+                -- the primary keyword's source facts/thoughts (tagged_with, undirected)
+                SELECT (CASE WHEN r.from_entity_id = %(pid)s THEN r.to_entity_id
+                             ELSE r.from_entity_id END) AS fid
+                FROM relations r
+                JOIN entities f ON f.id = (CASE WHEN r.from_entity_id = %(pid)s
+                                               THEN r.to_entity_id ELSE r.from_entity_id END)
+                                AND f.entity_type IN ('fact','thought')
+                WHERE r.relation_type = 'tagged_with'
+                  AND (r.from_entity_id = %(pid)s OR r.to_entity_id = %(pid)s)
+            ),
+            cand AS (
+                SELECT j.id
+                FROM wiki_job j
+                JOIN entities e ON e.id = j.entity_ids[1]
+                WHERE {_claimable("j")} AND j.job_type = 'triage' AND j.id <> %(xjob)s
+                  AND (
+                      e.id IN (SELECT fid FROM src)               -- a source fact's own job
+                      OR (
+                          e.entity_type = 'keyword'               -- a non-hub sibling keyword
+                          AND (SELECT count(*) FROM relations rk
+                               WHERE rk.relation_type = 'tagged_with'
+                                 AND (rk.from_entity_id = e.id OR rk.to_entity_id = e.id)
+                              ) < %(hub)s
+                          AND EXISTS (
+                              SELECT 1 FROM relations r2
+                              WHERE r2.relation_type = 'tagged_with'
+                                AND ((r2.from_entity_id = e.id AND r2.to_entity_id IN (SELECT fid FROM src))
+                                  OR (r2.to_entity_id = e.id AND r2.from_entity_id IN (SELECT fid FROM src)))
+                          )
+                      )
+                  )
+                ORDER BY e.importance DESC, j.created_at
+                FOR UPDATE OF j SKIP LOCKED
+                LIMIT %(limit)s
+            )
+            UPDATE wiki_job
+               SET status = 'assigned', assigned_at = now(), attempts = attempts + 1
+             WHERE id IN (SELECT id FROM cand)
+            RETURNING id, entity_ids::text[] AS entity_ids, batch_id
+            """,
+            {"pid": pid, "xjob": str(exclude_job_id),
+             "hub": WIKI_TRIAGE_HUB_DEGREE, "limit": limit},
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 def finish_job(conn, job_id: str, status: str, last_error: str | None = None) -> None:

@@ -13,7 +13,7 @@ from fastapi import APIRouter, Query
 
 from braindb.agent.agent import run_typed, get_maintainer_agent, get_writer_agent
 from braindb.agent.run_state import install_handoff_slot, release_handoff_slot
-from braindb.agent.schemas import MaintainerDecision, WikiWriteResult
+from braindb.agent.schemas import MaintainerClusterDecision, WikiWriteResult
 from braindb.config import settings
 from braindb.db import get_conn
 from braindb.services.activity_log import log_activity
@@ -40,149 +40,197 @@ def wiki_cron():
 @router.post("/maintain")
 async def wiki_maintain():
     """
-    Process EXACTLY ONE triage case (C1). Claims one pending triage job,
-    asks the existing agent to decide attach/create/consolidate/skip for that
-    single orphan, persists the resulting suggestion job, closes the triage.
+    Process ONE triage unit. Claims the highest-importance pending triage job
+    and — when WIKI_TRIAGE_CLUSTER is on and that seed is a non-hub keyword —
+    the other pending triage jobs whose entity shares a source fact with it
+    (`claim_related_triage`). The maintainer decides EVERY seed in ONE agent
+    call; each seed's own triage job is then closed with its own status
+    (skip→rejected, attach→done+suggestion, …), exactly as in the
+    one-at-a-time path. A singleton (or flag off) is just a 1-seed unit.
     """
-    # 1. Claim one case + staleness guard, atomically (one transaction).
+    # 1. Claim the unit (primary + related) + per-seed staleness guard — one txn.
     with get_conn() as conn:
-        job = wiki_jobs.claim_one_triage(conn)
-        if not job:
+        primary = wiki_jobs.claim_one_triage(conn)
+        if not primary:
             return {"claimed": 0, "message": "no pending triage jobs"}
-        orphan_id = job["entity_ids"][0]
-        job_id = str(job["id"])
-        batch_id = str(job["batch_id"]) if job["batch_id"] else None
-        orphan = wiki_jobs.fetch_entity_brief(conn, orphan_id)
+        batch_id = str(primary["batch_id"]) if primary["batch_id"] else None
+        primary_id = primary["entity_ids"][0]
+        primary_brief = wiki_jobs.fetch_entity_brief(conn, primary_id)
 
-        if not orphan:
-            wiki_jobs.finish_job(conn, job_id, "failed", "orphan entity not found")
-            return {"claimed": 1, "job_id": job_id, "result": "failed",
-                    "reason": "orphan missing"}
+        jobs = [primary]
+        if (wiki_jobs.WIKI_TRIAGE_CLUSTER and primary_brief
+                and primary_brief["entity_type"] == "keyword"):
+            jobs += wiki_jobs.claim_related_triage(
+                conn, primary_id, str(primary["id"]),
+                wiki_jobs.WIKI_TRIAGE_CLUSTER_MAX - 1)
 
-        # Stale-skip: a prior writer run may have already absorbed/linked this
-        # entity (or it's already in an active suggestion). If so, close the
-        # triage with NO LLM call — the writer's broad research retired it.
-        if not wiki_jobs.is_orphan(conn, orphan_id, exclude_triage_job_id=job_id):
-            wiki_jobs.finish_job(conn, job_id, "done",
-                                 "already covered — absorbed by a wiki")
-            return {"claimed": 1, "job_id": job_id, "result": "skipped_stale"}
+        # Per seed: brief + stale-skip. A stale/missing seed closes its OWN job
+        # now (done/failed) with NO LLM call — same as the one-at-a-time path.
+        seeds: list[dict] = []
+        for j in jobs:
+            jid, eid = str(j["id"]), j["entity_ids"][0]
+            brief = (primary_brief if eid == primary_id
+                     else wiki_jobs.fetch_entity_brief(conn, eid))
+            if not brief:
+                wiki_jobs.finish_job(conn, jid, "failed", "orphan entity not found")
+                continue
+            if not wiki_jobs.is_orphan(conn, eid, exclude_triage_job_id=jid):
+                wiki_jobs.finish_job(conn, jid, "done",
+                                     "already covered — absorbed by a wiki")
+                continue
+            seeds.append({"job_id": jid, "brief": brief})
 
-        # Catalog of existing wikis the model will reference BY NUMBER (never
-        # by uuid). This in-request list IS the numbering used to resolve the
-        # model's chosen number(s) back to ids below.
+        if not seeds:
+            return {"claimed": len(jobs), "result": "skipped_stale"}
+
+        # Catalog the model references BY NUMBER; this in-request list IS the
+        # numbering used to resolve its chosen number(s) back to ids below.
         cat = wiki_jobs.list_active_wikis(conn)
 
-    # 2. One agent call. The prompt directs it to RESEARCH the neighbourhood
-    #    with its own tools (recall_memory / view_tree / delegate_to_subagent)
-    #    before deciding — we give the seed, the LLM gathers the context.
-    #    Generous turns so it can actually investigate / delegate.
+    # 2. ONE agent call for all live seeds. The prompt directs it to RESEARCH
+    #    EACH seed's own subject (recall_memory / view_tree / delegate) before
+    #    deciding — co-occurrence is not identity. Returns one decision per seed.
     catalog_txt = (
         "\n".join(f"{i}. {w['canonical_name']}" for i, w in enumerate(cat, 1))
         or "(no existing wikis yet — attach/consolidate are impossible; "
            "use create/skip/ambiguous)"
     )
     prompt = _MAINTAINER_PROMPT.format(
-        entity_id=orphan_id,
-        entity_type=orphan["entity_type"],
-        keywords=orphan.get("keywords") or [],
-        summary=orphan.get("summary"),
-        content=(orphan.get("content") or "")[:4000],
-        wiki_catalog=catalog_txt,
+        seeds=_seeds_block(seeds), wiki_catalog=catalog_txt
     )
-    # `run_typed` returns a SDK-validated MaintainerDecision, or raises if
-    # the model never submitted (e.g. max_turns hit) — that error path
-    # below treats it like any other agent failure (release + log + 5xx).
+    # `run_typed` returns an SDK-validated MaintainerClusterDecision, or raises
+    # if the model never submitted — handled below like any agent failure.
     try:
-        res: MaintainerDecision = await run_typed(
-            prompt, get_maintainer_agent(), MaintainerDecision, max_turns=30
+        res: MaintainerClusterDecision = await run_typed(
+            prompt, get_maintainer_agent(), MaintainerClusterDecision, max_turns=30
         )
     except Exception as e:
         logger.exception("maintainer agent failed")
         with get_conn() as conn:
-            wiki_jobs.finish_job(conn, job_id, "failed", f"agent error: {e}"[:500])
-        return {"claimed": 1, "job_id": job_id, "result": "failed", "reason": str(e)}
+            wiki_jobs.finish_jobs(conn, [s["job_id"] for s in seeds], "failed",
+                                  f"agent error: {e}"[:500])
+        return {"claimed": len(jobs), "result": "failed", "reason": str(e)}
 
-    # Schema-validated; expose as a dict so the action handlers below are
-    # unchanged.
-    decision = res.model_dump()
-    action = decision.get("action")
-    rationale = decision.get("rationale")
+    by_id = {d.entity_id: d for d in res.decisions}
 
-    # 3. Persist the suggestion + close the triage, in one transaction.
+    # 3. Per seed: apply its decision + close its OWN job (same resolution as the
+    #    one-at-a-time path). A seed the model omitted is released for a normal
+    #    retry (never dropped). One transaction.
+    outcomes: dict[str, dict] = {}
     with get_conn() as conn:
         try:
-            if action in ("skip", "ambiguous"):
-                # 'ambiguous' = the data cannot disambiguate identity/scope;
-                # the LLM correctly refuses to mint a confident page. Treated
-                # as a deliberate skip (self-clears via run_cron).
-                wiki_jobs.finish_job(conn, job_id, "rejected", rationale)
-                outcome = {"action": action}
-
-            elif action == "attach":
-                no = decision.get("target_wiki_no")
-                target = (cat[no - 1]["id"]
-                          if isinstance(no, int) and 1 <= no <= len(cat)
-                          else None)
-                if not target or not _is_wiki(conn, target):
-                    wiki_jobs.finish_job(
-                        conn, job_id, "failed",
-                        f"attach: target_wiki_no {no!r} not a valid catalog number (1..{len(cat)})")
-                    outcome = {"action": "attach", "error": "invalid target_wiki_no"}
-                else:
-                    key = wiki_jobs.suggestion_dedupe_key("attach", target, [orphan_id], [])
-                    sid = wiki_jobs.insert_suggestion(
-                        conn, job_type="attach", target_wiki_id=target,
-                        entity_ids=[orphan_id], dedupe_key=key, rationale=rationale,
-                        proposed_name=None, batch_id=batch_id)
-                    wiki_jobs.finish_job(conn, job_id, "done", rationale)
-                    outcome = {"action": "attach", "suggestion_id": sid, "target_wiki_id": target}
-
-            elif action == "create":
-                name = decision.get("proposed_name")
-                if not name:
-                    wiki_jobs.finish_job(conn, job_id, "failed", "create missing proposed_name")
-                    outcome = {"action": "create", "error": "missing proposed_name"}
-                else:
-                    key = wiki_jobs.suggestion_dedupe_key("create", None, [orphan_id], [])
-                    sid = wiki_jobs.insert_suggestion(
-                        conn, job_type="create", target_wiki_id=None,
-                        entity_ids=[orphan_id], dedupe_key=key, rationale=rationale,
-                        proposed_name=name, batch_id=batch_id)
-                    wiki_jobs.finish_job(conn, job_id, "done", rationale)
-                    outcome = {"action": "create", "suggestion_id": sid, "proposed_name": name}
-
-            elif action == "consolidate":
-                nos = decision.get("consolidate_nos") or []
-                ids = [cat[n - 1]["id"] for n in nos
-                       if isinstance(n, int) and 1 <= n <= len(cat)]
-                wiki_ids = list(dict.fromkeys(ids))  # dedupe, keep order
-                if len(wiki_ids) < 2:
-                    wiki_jobs.finish_job(
-                        conn, job_id, "failed",
-                        f"consolidate: need >=2 valid catalog numbers, got {nos!r} (1..{len(cat)})")
-                    outcome = {"action": "consolidate", "error": "need >=2 valid catalog numbers"}
-                else:
-                    key = wiki_jobs.suggestion_dedupe_key("consolidate", None, [], wiki_ids)
-                    sid = wiki_jobs.insert_suggestion(
-                        conn, job_type="consolidate", target_wiki_id=None,
-                        entity_ids=wiki_ids, dedupe_key=key, rationale=rationale,
-                        proposed_name=None, batch_id=batch_id)
-                    # The orphan itself is still unconnected; closing 'done'
-                    # lets the next cron re-triage it after the merge.
-                    wiki_jobs.finish_job(conn, job_id, "done", rationale)
-                    outcome = {"action": "consolidate", "suggestion_id": sid, "wiki_ids": wiki_ids}
-
-            else:
-                wiki_jobs.finish_job(conn, job_id, "failed", f"unknown action {action!r}")
-                outcome = {"action": action, "error": "unknown action"}
-
-            log_activity(conn, "wiki_maintain", orphan["entity_type"], orphan_id,
-                         details={"job_id": job_id, **outcome})
-        except Exception as e:
+            for s in seeds:
+                eid = s["brief"]["id"]
+                d = by_id.get(eid)
+                if d is None:
+                    wiki_jobs.release_or_fail_jobs(
+                        conn, [s["job_id"]], "maintainer omitted this seed")
+                    outcomes[eid] = {"action": "released_omitted"}
+                    continue
+                outcomes[eid] = _apply_decision(
+                    conn, decision=d.model_dump(), orphan=s["brief"],
+                    job_id=s["job_id"], cat=cat, batch_id=batch_id)
+        except Exception:
             logger.exception("maintainer persistence failed")
             raise
 
-    return {"claimed": 1, "job_id": job_id, "result": outcome}
+    return {"claimed": len(jobs), "seeds": len(seeds), "result": outcomes}
+
+
+def _seeds_block(seeds: list[dict]) -> str:
+    """Render the claimed seeds as a list the maintainer decides one-by-one.
+    Each carries its entity_id — the decision must echo it back."""
+    out = []
+    for s in seeds:
+        b = s["brief"]
+        out.append(
+            f"- entity_id: {b['id']}\n"
+            f"  entity_type: {b['entity_type']}\n"
+            f"  keywords: {b.get('keywords') or []}\n"
+            f"  summary: {b.get('summary')}\n"
+            f"  content: {(b.get('content') or '')[:4000]}"
+        )
+    return "\n".join(out)
+
+
+def _apply_decision(conn, *, decision: dict, orphan: dict, job_id: str,
+                    cat: list[dict], batch_id: str | None) -> dict:
+    """Resolve ONE maintainer decision for one seed and close THAT seed's triage
+    job — the exact attach/create/consolidate/skip handling used in the
+    one-at-a-time path, applied per seed. Wikis are referenced by catalog NUMBER
+    (`cat` is the numbering)."""
+    orphan_id = orphan["id"]
+    action = decision.get("action")
+    rationale = decision.get("rationale")
+
+    if action in ("skip", "ambiguous"):
+        # 'ambiguous' = the data cannot disambiguate identity/scope; the LLM
+        # correctly refuses to mint a confident page. Treated as a deliberate
+        # skip (self-clears via run_cron).
+        wiki_jobs.finish_job(conn, job_id, "rejected", rationale)
+        outcome = {"action": action}
+
+    elif action == "attach":
+        no = decision.get("target_wiki_no")
+        target = (cat[no - 1]["id"]
+                  if isinstance(no, int) and 1 <= no <= len(cat)
+                  else None)
+        if not target or not _is_wiki(conn, target):
+            wiki_jobs.finish_job(
+                conn, job_id, "failed",
+                f"attach: target_wiki_no {no!r} not a valid catalog number (1..{len(cat)})")
+            outcome = {"action": "attach", "error": "invalid target_wiki_no"}
+        else:
+            key = wiki_jobs.suggestion_dedupe_key("attach", target, [orphan_id], [])
+            sid = wiki_jobs.insert_suggestion(
+                conn, job_type="attach", target_wiki_id=target,
+                entity_ids=[orphan_id], dedupe_key=key, rationale=rationale,
+                proposed_name=None, batch_id=batch_id)
+            wiki_jobs.finish_job(conn, job_id, "done", rationale)
+            outcome = {"action": "attach", "suggestion_id": sid, "target_wiki_id": target}
+
+    elif action == "create":
+        name = decision.get("proposed_name")
+        if not name:
+            wiki_jobs.finish_job(conn, job_id, "failed", "create missing proposed_name")
+            outcome = {"action": "create", "error": "missing proposed_name"}
+        else:
+            key = wiki_jobs.suggestion_dedupe_key("create", None, [orphan_id], [])
+            sid = wiki_jobs.insert_suggestion(
+                conn, job_type="create", target_wiki_id=None,
+                entity_ids=[orphan_id], dedupe_key=key, rationale=rationale,
+                proposed_name=name, batch_id=batch_id)
+            wiki_jobs.finish_job(conn, job_id, "done", rationale)
+            outcome = {"action": "create", "suggestion_id": sid, "proposed_name": name}
+
+    elif action == "consolidate":
+        nos = decision.get("consolidate_nos") or []
+        ids = [cat[n - 1]["id"] for n in nos
+               if isinstance(n, int) and 1 <= n <= len(cat)]
+        wiki_ids = list(dict.fromkeys(ids))  # dedupe, keep order
+        if len(wiki_ids) < 2:
+            wiki_jobs.finish_job(
+                conn, job_id, "failed",
+                f"consolidate: need >=2 valid catalog numbers, got {nos!r} (1..{len(cat)})")
+            outcome = {"action": "consolidate", "error": "need >=2 valid catalog numbers"}
+        else:
+            key = wiki_jobs.suggestion_dedupe_key("consolidate", None, [], wiki_ids)
+            sid = wiki_jobs.insert_suggestion(
+                conn, job_type="consolidate", target_wiki_id=None,
+                entity_ids=wiki_ids, dedupe_key=key, rationale=rationale,
+                proposed_name=None, batch_id=batch_id)
+            # The orphan itself is still unconnected; closing 'done' lets the
+            # next cron re-triage it after the merge.
+            wiki_jobs.finish_job(conn, job_id, "done", rationale)
+            outcome = {"action": "consolidate", "suggestion_id": sid, "wiki_ids": wiki_ids}
+
+    else:
+        wiki_jobs.finish_job(conn, job_id, "failed", f"unknown action {action!r}")
+        outcome = {"action": action, "error": "unknown action"}
+
+    log_activity(conn, "wiki_maintain", orphan["entity_type"], orphan_id,
+                 details={"job_id": job_id, **outcome})
+    return outcome
 
 
 def _members_block(members: list[dict]) -> str:

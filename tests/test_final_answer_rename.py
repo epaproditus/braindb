@@ -24,6 +24,7 @@ from braindb.agent import agent as agent_module
 from braindb.agent import run_state
 from braindb.agent.schemas import (
     AgentAnswer,
+    MaintainerClusterDecision,
     MaintainerDecision,
     SubagentResult,
     WikiWriteResult,
@@ -441,7 +442,10 @@ def test_expected_shape_hint_covers_required_keys(model, required_keys, must_con
     "tool, model, pydantic_required",
     [
         (submit_answer, AgentAnswer, ["answer"]),
-        (submit_maintainer, MaintainerDecision, ["action", "rationale"]),
+        # submit_maintainer now carries the clustered schema: a `decisions`
+        # list (one MaintainerClusterItem per seed); `decisions` is its only
+        # required field. The per-seed item still reuses MaintainerDecision.
+        (submit_maintainer, MaintainerClusterDecision, ["decisions"]),
         # body became optional with the section-edit work; only mode is
         # still required at the Pydantic level.
         (submit_wiki, WikiWriteResult, ["mode"]),

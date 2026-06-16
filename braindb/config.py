@@ -44,6 +44,14 @@ _LLM_PROFILES: dict[str, dict[str, str]] = {
         "api_key_env": "VLLM_API_KEY",
         "base_url": "http://host.docker.internal:8009/v1",
     },
+    # Gemma 4 12B (QAT w4a16) on the workstation vLLM — a SMALLER, distinct model
+    # from the 31B above, on its own port. Reached over the laptop/Pi -> workstation
+    # tunnel to :8012.
+    "vllm_workstation_gemma12b": {
+        "model": "openai/google/gemma-4-12B-it-qat-w4a16-ct",
+        "api_key_env": "VLLM_API_KEY",
+        "base_url": "http://host.docker.internal:8012/v1",
+    },
 }
 
 

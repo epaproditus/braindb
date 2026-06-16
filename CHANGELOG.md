@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-06-16
+
+Headline: the wiki maintainer now batches related orphan triage into ONE LLM call —
+same-subject keywords that share a source fact are decided together, one decision per
+seed — cutting maintainer LLM calls while keeping decisions and the job lifecycle
+identical to before. Also in this release: a self-hosted Gemma 4 12B LLM profile and an
+env-configurable Hermes ask-timeout.
+
+### Added
+
+- **Batched wiki triage (clustered maintainer).** When the maintainer runs and the
+  claimed seed is a non-hub keyword, it also claims the other pending triage jobs whose
+  entity shares a source fact (sibling keywords + that fact's own job) and decides them
+  all in ONE agent call — one decision per seed. `run_cron` and the per-job lifecycle are
+  unchanged (each job still closes with its own status); a singleton, or the flag off, is
+  a one-seed unit identical to before. Gated by `WIKI_TRIAGE_CLUSTER` (default on, with
+  `WIKI_TRIAGE_CLUSTER_MAX` / `WIKI_TRIAGE_HUB_DEGREE` to tune it). Validated A/B against
+  the one-at-a-time path on the same snapshot: identical decision split, near-identical
+  wikis, ~1.6 orphans decided per LLM call, and co-occurring seeds decided independently
+  (no conflation).
+- **`vllm_workstation_gemma12b` LLM profile.** A self-hosted vLLM profile for Gemma 4 12B;
+  select it with `LLM_PROFILE=vllm_workstation_gemma12b` to run the internal agent on the
+  local Gemma model.
+
+### Changed
+
+- **Hermes `MemoryProvider` ask-timeout is env-configurable.** `BRAINDB_ASK_TIMEOUT`
+  (default 600s, previously a hardcoded 90s) so a slow `/agent/query` LLM loop does not
+  time out before the agent finishes.
+
 ## [0.7.0] — 2026-06-14
 
 Headline: BrainDB becomes a native long-term-memory backend for **Hermes Agent**
