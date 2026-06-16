@@ -39,6 +39,7 @@ from braindb.services import wiki_sections as ws
 from braindb.agent.run_state import record_handoff, record_submit
 from braindb.agent.schemas import (
     AgentAnswer,
+    MaintainerClusterDecision,
     MaintainerDecision,
     SubagentResult,
     WikiWriteResult,
@@ -1180,8 +1181,8 @@ async def submit_answer(payload: AgentAnswer) -> str:
 
 @function_tool(name_override="final_answer", strict_mode=False)
 @_verbose("final_answer")
-async def submit_maintainer(payload: MaintainerDecision) -> str:
-    """Submit the maintainer decision. Call this exactly once when you're done."""
+async def submit_maintainer(payload: MaintainerClusterDecision) -> str:
+    """Submit the maintainer decisions (one entry per seed). Call this exactly once when you're done."""
     record_submit(payload)
     return "ok"
 

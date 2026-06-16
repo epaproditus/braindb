@@ -206,6 +206,41 @@ class MaintainerDecision(BaseModel):
         return _coerce_to_list(v)
 
 
+class MaintainerClusterItem(MaintainerDecision):
+    """One per-seed decision inside a clustered triage. Identical to
+    `MaintainerDecision` (same fields + the same forgiving coercion validators,
+    inherited) plus the `entity_id` of the seed it applies to, so the harness
+    maps each decision back to its orphan."""
+    entity_id: str = Field(
+        ...,
+        description=(
+            "The seed's entity_id, copied VERBATIM from the SEEDS list in the "
+            "prompt. Identifies which orphan THIS decision is for."
+        ),
+    )
+
+
+class MaintainerClusterDecision(BaseModel):
+    """The maintainer's output for a triage cluster: one decision per seed. A
+    singleton triage is just a cluster of one (a single-element list), so this
+    is the maintainer's only output schema. The harness applies each item
+    exactly as it applied a `MaintainerDecision` before."""
+    decisions: list[MaintainerClusterItem] = Field(
+        ...,
+        description=(
+            "Exactly one entry per seed in the SEEDS list — do not omit a seed "
+            "and do not invent seeds. Each entry is a full decision (action + "
+            "its action-specific fields + rationale) plus the seed's entity_id."
+        ),
+    )
+
+    # Top-level coercion: accept JSON-string-of-dict (vLLM/Qwen quirk).
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_json_string(cls, v):
+        return _maybe_parse_json_string(v)
+
+
 class WikiWriteResult(BaseModel):
     """The wiki writer's full output. `body` is the complete markdown page —
     a typed field of the schema, exactly like any other field (not loose
